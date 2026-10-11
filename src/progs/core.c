@@ -472,6 +472,14 @@ static __always_inline bool perfetto_owner_matches(bpf_args_t *args,
 static __always_inline bool perfetto_packet_supported(packet_t *pkt)
 {
 	return pkt->proto_l4 == IPPROTO_TCP ||
+	       pkt->proto_l4 == IPPROTO_UDP ||
+	       pkt->proto_l4 == IPPROTO_ICMP ||
+	       pkt->proto_l4 == IPPROTO_ICMPV6;
+}
+
+static __always_inline bool perfetto_transport_packet_supported(packet_t *pkt)
+{
+	return pkt->proto_l4 == IPPROTO_TCP ||
 	       pkt->proto_l4 == IPPROTO_UDP;
 }
 
@@ -540,7 +548,7 @@ static __always_inline perfetto_flow_owner_t *perfetto_lookup_flow(
 {
 	perfetto_flow_owner_t *flow;
 	perfetto_owner_t *owner;
-	if (!perfetto_packet_supported(pkt))
+	if (!perfetto_transport_packet_supported(pkt))
 		return NULL;
 	__builtin_memset(key, 0, sizeof(*key));
 	perfetto_flow_key(pkt, key, netns);
@@ -563,7 +571,7 @@ static __always_inline void perfetto_store_flow(packet_t *pkt,
 	u16 port;
 	int i;
 
-	if (!direction || !perfetto_packet_supported(pkt))
+	if (!direction || !perfetto_transport_packet_supported(pkt))
 		return;
 	__builtin_memset(key, 0, sizeof(*key));
 	value->owner = *owner;
@@ -774,6 +782,13 @@ __attribute__((noinline)) int perfetto_record_identity(detail_event_t *detail,
 
 	if (!detail)
 		return 0;
+	/* ICMP can be generated while a transport syscall is active. Keep its
+	 * packet identity without attributing it to that unrelated operation. */
+	if (skb_key && !perfetto_transport_packet_supported(&detail->pkt)) {
+		detail->key_generation = perfetto_packet_generation(
+			skb_key, func_is_free(func_status), false);
+		return 0;
+	}
 
 	if (perfetto_socket_io(func) && !is_return)
 		perfetto_io_enter(sk_key, detail->pkt.ts,
@@ -860,6 +875,8 @@ static __attribute__((noinline)) int perfetto_handle_owner(
 	u32 uid = (u32)bpf_get_current_uid_gid();
 	u8 direction = perfetto_status_direction(info->func_status);
 	bool current_matches = perfetto_current_matches(args, tid, uid);
+	bool icmp = skb && (event->pkt.proto_l4 == IPPROTO_ICMP ||
+			    event->pkt.proto_l4 == IPPROTO_ICMPV6);
 	bool owner_valid;
 	u32 scratch_key = 0;
 
@@ -877,8 +894,8 @@ static __attribute__((noinline)) int perfetto_handle_owner(
 	if (!sk && skb)
 		sk = _C(skb, sk);
 	owner_valid = perfetto_resolve_socket_owner(
-		sk, direction == PACKET_DIRECTION_TX ||
-		    (info->func_status & FUNC_STATUS_RET), owner,
+		sk, !icmp && (direction == PACKET_DIRECTION_TX ||
+			      (info->func_status & FUNC_STATUS_RET)), owner,
 		tid, tgid, uid);
 
 	if (skb) {
@@ -900,11 +917,13 @@ static __attribute__((noinline)) int perfetto_handle_owner(
 		return -1;
 	}
 
-	if ((args->pid || args->uid_enabled) && !current_matches &&
+	/* ICMP ownership requires socket evidence. A receive or kernel-generated
+	 * reply can run in an unrelated task, even at an output probe. */
+	if ((args->pid || args->uid_enabled) && (icmp || !current_matches) &&
 	    (!owner_valid || !perfetto_owner_matches(args, owner)))
 		return -1;
 
-	if (!owner_valid && current_matches) {
+	if (!owner_valid && current_matches && !icmp) {
 		*owner = (perfetto_owner_t) {
 			.tid = tid,
 			.tgid = tgid,

@@ -90,7 +90,9 @@ static struct native_track *native_socket_track(u64 id,u32 p,const char *s) { re
 static struct flow_state *flow_find_any(u64 id) { return id == flow.id ? &flow : NULL; }
 static struct flow_state *flow_find(u64 id) { return flow_find_any(id); }
 static struct flow_state *flow_find_by_socket(u64 id,u8 p) { return id == flow.socket_id ? &flow : NULL; }
-static u64 detail_flow_id(const detail_event_t *d,bool s) { return flow.id; }
+static u64 detail_flow_id(const detail_event_t *d,bool s) {
+    return d->pkt.proto_l4 == IPPROTO_ICMP || d->pkt.proto_l4 == IPPROTO_ICMPV6 ? 0 : flow.id;
+}
 static const char *trace_event_name(const trace_t *t,const void *e) { return t->name; }
 static trace_t *get_trace(u16 index) { return &receive; }
 static void native_event_write(u64 ts, struct proto_buffer *e) {
@@ -99,8 +101,17 @@ static void native_event_write(u64 ts, struct proto_buffer *e) {
     fwrite(&ts, sizeof(ts), 1, native_file);
     fwrite(e->data, e->size, 1, native_file);
 }
+/* This harness isolates packet/link formatting; bounded overview buffering
+ * and its real TracePacket output are exercised in test_socket_overview_native. */
+static void native_packet_overview_observe(const detail_event_t *detail) {}
+static void native_packet_overview_queue(const detail_event_t *detail, u64 flow_id,
+    u64 thread_uuid, const char *name, struct proto_buffer *event,
+    size_t annotation_offset, size_t annotation_size) {
+    native_event_write(detail->pkt.ts, event);
+}
 '''
         helpers = "".join(function(source, name) for name in (
+            "packet_is_icmp", "packet_is_icmp_echo",
             "flow_label_prefix", "format_flow_label", "format_known_flow_label",
             "format_packet_flow_label", "flow_protocol_name", "packet_submission_ids",
             "flow_packet_anchor", "packet_trace_terminal", "flow_link_socket", "pending_io_emit_start",
@@ -152,6 +163,28 @@ int main(int argc, char **argv) {
     rx_handoff_event_t ready={.kind=RX_HANDOFF_READY,.ts=170,.socket_key=90,
         .socket_generation=1,.tid=77,.tgid=77};
     export_rx_handoff(&ready,0);
+    /* ICMP packets carry header metadata and skb identity without a transport flow. */
+    for (int v6=0; v6<2; v6++) {
+        detail_event_t icmp = {.key=200+v6*10,.key_generation=1,.tid=77,.tgid=77,
+            .direction=PACKET_DIRECTION_TX};
+        icmp.pkt.proto_l3=v6 ? ETH_P_IPV6 : ETH_P_IP;
+        icmp.pkt.proto_l4=v6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP;
+        icmp.pkt.ts=200+v6*100;
+        icmp.pkt.l4.icmp.type=v6 ? 128 : 8;
+        icmp.pkt.l4.icmp.id=htons(1234); icmp.pkt.l4.icmp.seq=htons(7);
+        stage.name=v6 ? "ip6_output" : "ip_output";
+        native_export_packet_event(&icmp,&stage,0); export_packet_event(&icmp,&stage,0);
+        icmp.pkt.ts++; stage.name="dev_hard_start_xmit";
+        native_export_packet_event(&icmp,&stage,0); export_packet_event(&icmp,&stage,0);
+        icmp.key++; icmp.pkt.ts++; icmp.direction=PACKET_DIRECTION_RX;
+        icmp.pkt.l4.icmp.type=v6 ? 129 : 0;
+        stage.name=v6 ? "icmpv6_rcv" : "icmp_rcv";
+        native_export_packet_event(&icmp,&stage,0); export_packet_event(&icmp,&stage,0);
+        /* Error headers reuse the bytes that echo uses for id/sequence. */
+        icmp.key++; icmp.pkt.ts++; icmp.pkt.l4.icmp.type=v6 ? 1 : 3;
+        icmp.pkt.l4.icmp.code=1;
+        native_export_packet_event(&icmp,&stage,0); export_packet_event(&icmp,&stage,0);
+    }
     fclose(native_file); fclose(export_file);
     return 0;
 }
@@ -184,11 +217,12 @@ int main(int argc, char **argv) {
     def args(event):
         return {a.name: a.string_value for a in event.debug_annotations}
 
-    def events_in(self, category):
-        return [(ts, event) for ts, event in self.events if category in event.categories]
+    def events_in(self, category, protocol=None):
+        return [(ts, event) for ts, event in self.events if category in event.categories
+                and (protocol is None or self.args(event).get("proto_l4") == str(protocol))]
 
     def test_packet_chains_have_stage_names_and_never_join_different_skbs(self):
-        packets = self.events_in("anettrace.packet")
+        packets = self.events_in("anettrace.packet", protocol=6)
         self.assertEqual(len(packets), 3)
         first, later, other = [event for _, event in packets]
         self.assertEqual(first.name, "tcp-1 · ip_output")
@@ -203,7 +237,7 @@ int main(int argc, char **argv) {
             self.assertIn("socket_id", args)
 
     def test_async_transmit_keeps_observed_call_without_reopening_io_flow(self):
-        packets = [self.args(e) for _, e in self.events_in("anettrace.packet")]
+        packets = [self.args(e) for _, e in self.events_in("anettrace.packet", protocol=6)]
         self.assertEqual(packets[0]["io_id"], packets[1]["io_id"])
         self.assertEqual(packets[0]["call_id"], packets[1]["call_id"])
         self.assertNotEqual(packets[1]["call_id"], "0000000000000000")
@@ -243,6 +277,42 @@ int main(int argc, char **argv) {
         args = self.args(self.events_in("anettrace.io.complete")[0][1])
         for key in ("flow_id", "socket_id", "io_id", "call_id", "flow_tag", "association"):
             self.assertEqual(record[key], args[key])
+
+    def test_icmp_native_and_json_metadata_do_not_invent_ports_or_connections(self):
+        for protocol, label, request, reply, error in (
+                (1, "icmp", 8, 0, 3), (58, "icmpv6", 128, 129, 1)):
+            with self.subTest(protocol=protocol):
+                native = self.events_in("anettrace.packet", protocol=protocol)
+                records = [r for r in self.records if r.get("proto_l4") == protocol]
+                self.assertEqual(len(native), 4)
+                self.assertEqual(len(records), 4)
+                for (_, event), record, kind in zip(native, records, (request, request, reply, error)):
+                    args = self.args(event)
+                    self.assertEqual(args["flow_tag"], label)
+                    self.assertTrue(event.name.startswith(label + " · "))
+                    self.assertFalse(event.correlation_id)
+                    self.assertEqual(record["flow_id"], "0000000000000000")
+                    self.assertFalse(record["flow_anchor"])
+                    self.assertEqual(args["owner_valid"], "false")
+                    for key in ("sport", "dport", "tcp_seq", "tcp_flags", "dns_transaction_id"):
+                        self.assertNotIn(key, args)
+                        self.assertNotIn(key, record)
+                    self.assertEqual(record["icmp_type"], kind)
+                    self.assertEqual(record["icmp_code"], 1 if kind == error else 0)
+                    for key in ("icmp_type", "icmp_code", "direction"):
+                        self.assertEqual(args[key], str(record[key]))
+                    if kind == error:
+                        self.assertNotIn("icmp_id", args)
+                        self.assertNotIn("icmp_seq", args)
+                        self.assertNotIn("icmp_id", record)
+                        self.assertNotIn("icmp_seq", record)
+                    else:
+                        self.assertEqual(record["icmp_id"], 1234)
+                        self.assertEqual(record["icmp_seq"], 7)
+                        self.assertEqual(args["icmp_id"], "1234")
+                        self.assertEqual(args["icmp_seq"], "7")
+                self.assertEqual(list(native[0][1].flow_ids), list(native[1][1].flow_ids))
+                self.assertNotEqual(list(native[0][1].flow_ids), list(native[2][1].flow_ids))
 
 
 if __name__ == "__main__":
