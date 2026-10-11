@@ -832,6 +832,7 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 	session->snapshot.filter = session->filter;
 	session->snapshot.warning = session->warning;
 	session->snapshot.interval_seconds = args->traffic_interval;
+	session->snapshot.flows = true;
 	if (traffic_display_open(&session->display))
 		traffic_render_cached(session);
 	return 0;
@@ -850,6 +851,13 @@ bool traffic_poll(void)
 		return true;
 	if (key == 'p' || key == 'f') {
 		session->snapshot.flows = key == 'f';
+		session->display.first_row = 0;
+		traffic_render_cached(session);
+	} else if (key == 'j' || key == 'k') {
+		if (key == 'j' && session->display.first_row < session->snapshot.row_count)
+			session->display.first_row++;
+		else if (key == 'k' && session->display.first_row)
+			session->display.first_row--;
 		traffic_render_cached(session);
 	}
 	return traffic_tick(false);

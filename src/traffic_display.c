@@ -114,9 +114,45 @@ int traffic_display_read_key(struct traffic_display *display)
 	if (!display->active || !display->input_saved)
 		return 0;
 	while (consumed++ < 64 && read(STDIN_FILENO, &key, 1) == 1)
-		if (key == 'p' || key == 'f' || key == 'q')
+		if (key == 'p' || key == 'f' || key == 'j' || key == 'k' || key == 'q')
 			return key;
 	return 0;
+}
+
+/* Keep complete IPv6 addresses and ports, including in a phone terminal. */
+static unsigned int traffic_endpoint_lines(const char *endpoint, unsigned int width)
+{
+	size_t length = strlen(endpoint);
+	unsigned int chunk = width - 8;
+
+	return length ? (unsigned int)((length + chunk - 1) / chunk) : 1;
+}
+
+static void traffic_render_endpoint(struct traffic_frame *frame,
+				    const char *label, const char *endpoint)
+{
+	unsigned int chunk = frame->width - 8;
+	size_t offset = 0, length = strlen(endpoint);
+
+	do {
+		traffic_line(frame, COLOR_MUTED, "%-7s%.*s", offset ? "" : label,
+			     (int)chunk, endpoint + offset);
+		offset += length - offset < chunk ? length - offset : chunk;
+	} while (offset < length);
+}
+
+static unsigned int traffic_row_lines(const struct traffic_display_row *row,
+				     bool flows, bool wide, bool spacing,
+				     unsigned int width)
+{
+	unsigned int lines = wide ? 1 : 3;
+
+	if (flows) {
+		lines = wide ? 1 : 4;
+		lines += traffic_endpoint_lines(row->local, width);
+		lines += traffic_endpoint_lines(row->remote, width);
+	}
+	return lines + spacing;
 }
 
 static void traffic_render_row(struct traffic_frame *frame,
@@ -134,20 +170,27 @@ static void traffic_render_row(struct traffic_frame *frame,
 	else
 		snprintf(status, sizeof(status), "%u recent flows", row->flow_count);
 	if (wide) {
-		traffic_line(frame, NULL, "%-7u %-16.16s %12s %12s %11s %11s %s",
-			     row->pid, row->comm, rx, tx, rx_total, tx_total, status);
-		if (flows)
-			traffic_line(frame, COLOR_MUTED, "  TID %u %.7s  L %.63s  R %.63s",
-				     row->tid, row->protocol, row->local, row->remote);
-	} else {
-		if (flows)
-			traffic_line(frame, NULL, "%u/%u %.16s %.7s", row->pid,
-				     row->tid, row->comm, row->protocol);
-		else
-			traffic_line(frame, NULL, "%u %.16s | %s", row->pid, row->comm, status);
 		if (flows) {
-			traffic_line(frame, COLOR_MUTED, "L %.63s", row->local);
-			traffic_line(frame, COLOR_MUTED, "R %.63s", row->remote);
+			traffic_line(frame, NULL, "%-7u %-16.16s %-7u %-3.3s %12s %12s %11s %11s",
+				     row->tid, row->comm, row->pid, row->protocol,
+				     rx, tx, rx_total, tx_total);
+			traffic_render_endpoint(frame, "Local", row->local);
+			traffic_render_endpoint(frame, "Remote", row->remote);
+		} else {
+			traffic_line(frame, NULL, "%-7u %-16.16s %12s %12s %11s %11s %s",
+				     row->pid, row->comm, rx, tx, rx_total, tx_total, status);
+		}
+	} else {
+		if (flows) {
+			traffic_line(frame, NULL, "TID %u %.16s", row->tid, row->comm);
+			traffic_line(frame, COLOR_MUTED, "PID %u %.7s%s", row->pid,
+				     row->protocol, row->idle_seconds >= 1 ? " | idle" : "");
+		} else {
+			traffic_line(frame, NULL, "%u %.16s | %s", row->pid, row->comm, status);
+		}
+		if (flows) {
+			traffic_render_endpoint(frame, "Local", row->local);
+			traffic_render_endpoint(frame, "Remote", row->remote);
 		}
 		traffic_line(frame, COLOR_RX, " RX %-12s | %s", rx, rx_total);
 		traffic_line(frame, COLOR_TX, " TX %-12s | %s", tx, tx_total);
@@ -173,7 +216,7 @@ void traffic_display_render(struct traffic_display *display,
 	struct winsize window = {0};
 	struct traffic_frame frame = {.width = 80, .limit = 23};
 	char rx[32], tx[32], rx_total[32], tx_total[32];
-	unsigned int warning_lines, row_lines, available, shown, i;
+	unsigned int warning_lines, footer_lines, available, shown, i;
 	bool wide, spacing;
 
 	if (!display->active || !snapshot)
@@ -192,7 +235,7 @@ void traffic_display_render(struct traffic_display *display,
 		goto done;
 	}
 	traffic_line(&frame, COLOR_TITLE, "%s  %s  %.0fs",
-		     snapshot->flows ? "FLOW VIEW" : "PROCESS VIEW",
+		     snapshot->flows ? "THREAD VIEW" : "PROCESS VIEW",
 		     snapshot->protocol ? snapshot->protocol : "TCP/UDP", snapshot->elapsed_seconds);
 	traffic_line(&frame, COLOR_MUTED, "%s | every %us",
 		     snapshot->filter ? snapshot->filter : "All processes", snapshot->interval_seconds);
@@ -206,31 +249,47 @@ void traffic_display_render(struct traffic_display *display,
 	traffic_line(&frame, COLOR_TX, "TX now      %s", tx);
 	traffic_line(&frame, COLOR_MUTED, "TX session  %s", tx_total);
 	traffic_line(&frame, NULL, "");
-	wide = frame.width >= 100;
+	wide = frame.width >= (snapshot->flows ? 110 : 100);
 	spacing = !wide && frame.limit >= 30;
-	if (wide)
+	if (wide && snapshot->flows)
+		traffic_line(&frame, COLOR_MUTED, "%-7s %-16s %-7s %-3s %12s %12s %11s %11s",
+			     "TID", "THREAD", "PID", "P", "RX/s", "TX/s",
+			     "RX retained", "TX retained");
+	else if (wide)
 		traffic_line(&frame, COLOR_MUTED, "%-7s %-16s %12s %12s %11s %11s %s",
 			     "PID", "COMMAND", "RX/s", "TX/s",
 			     snapshot->flows ? "RX retained" : "RX session",
 			     snapshot->flows ? "TX retained" : "TX session", "RECENT");
 	else
 		traffic_line(&frame, COLOR_MUTED, snapshot->flows ?
-			     "Per flow: rate | retained total" : "Per process: rate | session total");
+			     "Thread / endpoint: rate | total" : "Per process: rate | session total");
 	warning_lines = traffic_warning_lines(snapshot->warning, frame.width);
 	/* Reserve the overflow indicator, payload semantics and controls. */
-	available = frame.limit > frame.used + warning_lines + 3 ?
-		frame.limit - frame.used - warning_lines - 3 : 0;
-	row_lines = wide ? (snapshot->flows ? 2 : 1) : (snapshot->flows ? 5 : 3);
-	row_lines += spacing;
-	shown = available / row_lines;
-	if (shown > snapshot->row_count)
-		shown = (unsigned int)snapshot->row_count;
-	for (i = 0; i < shown; i++)
-		traffic_render_row(&frame, &snapshot->rows[i], snapshot->flows, wide, spacing);
+	footer_lines = display->input_saved && frame.width < 44 ? 4 : 3;
+	available = frame.limit > frame.used + warning_lines + footer_lines ?
+		frame.limit - frame.used - warning_lines - footer_lines : 0;
+	if (!snapshot->row_count)
+		display->first_row = 0;
+	else if (display->first_row >= snapshot->row_count)
+		display->first_row = snapshot->row_count - 1;
+	shown = 0;
+	while (display->first_row + shown < snapshot->row_count) {
+		const struct traffic_display_row *row = &snapshot->rows[display->first_row + shown];
+		unsigned int lines = traffic_row_lines(row, snapshot->flows, wide, spacing,
+						       frame.width);
+
+		if (lines > available)
+			break;
+		traffic_render_row(&frame, row, snapshot->flows, wide, spacing);
+		available -= lines;
+		shown++;
+	}
 	if (!snapshot->row_count && available)
 		traffic_line(&frame, COLOR_MUTED, "Waiting for socket traffic...");
-	traffic_line(&frame, COLOR_MUTED, "%u shown | %zu more | idle visible 10s",
-		     shown, snapshot->row_count - shown);
+	traffic_line(&frame, COLOR_MUTED, "Rows %zu-%zu/%zu | %zu more",
+		     shown ? display->first_row + 1 : 0,
+		     shown ? display->first_row + shown : 0,
+		     snapshot->row_count, snapshot->row_count - shown);
 	for (i = 0; i < warning_lines; i++) {
 		size_t offset = (size_t)i * (frame.width - 1);
 		const char *suffix = snapshot->warning + offset;
@@ -241,8 +300,13 @@ void traffic_display_render(struct traffic_display *display,
 			traffic_line(&frame, COLOR_MUTED, "%.*s", (int)frame.width - 1, suffix);
 	}
 	traffic_line(&frame, COLOR_MUTED, "Socket I/O bytes; includes TLS / PEEK");
-	traffic_line(&frame, COLOR_MUTED, display->input_saved ?
-		     "p process | f flows | q quit" : "Ctrl-C stop");
+	if (display->input_saved && frame.width < 44) {
+		traffic_line(&frame, COLOR_MUTED, "p process | f threads | q quit");
+		traffic_line(&frame, COLOR_MUTED, "j next row | k previous row");
+	} else {
+		traffic_line(&frame, COLOR_MUTED, display->input_saved ?
+			     "p process | f threads | j/k rows | q quit" : "Ctrl-C stop");
+	}
 done:
 	fputs("\033[J", stdout);
 	fflush(stdout);

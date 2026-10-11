@@ -4,7 +4,7 @@ Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具�
 
 > 当前正式版：**v0.8.2**。完整安装说明、参数解释、模式组合、Android 抓取和排障指南已经移至 [GitHub Wiki](https://github.com/ron159/Anettrace/wiki)。
 
-> 本分支为 **Traffic UI 实验版**，基于 v0.8.2。终端流量概览增加当前速率、进程汇总和连接明细切换；[实验版使用说明](docs/traffic-overview-experiment.md)包含统计口径和限制。上方正式版本号及下方 Release 下载链接仍指向已发布的稳定版，实验构建以分支和 `--version` 中的 commit 区分。
+> 本分支为 **Traffic UI 实验版**，基于 v0.8.2。终端流量概览默认展示线程 ID、线程名称及完整本地/远端 IP 和端口，支持滚动查看明细、切换进程汇总；[实验版使用说明](docs/traffic-overview-experiment.md)包含统计口径和限制。上方正式版本号及下方 Release 下载链接仍指向已发布的稳定版，实验构建以分支和 `--version` 中的 commit 区分。
 
 [下载 v0.8.2](https://github.com/ron159/Anettrace/releases/tag/v0.8.2) · [使用手册](https://github.com/ron159/Anettrace/wiki) · [CLI 完整参考](https://github.com/ron159/Anettrace/wiki/CLI-Reference) · [问题反馈](https://github.com/ron159/Anettrace/issues)
 

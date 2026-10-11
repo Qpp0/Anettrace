@@ -28,12 +28,13 @@ struct traffic_display_snapshot {
 /* Zero-initialize before open; close is safe even when open was unsuccessful. */
 struct traffic_display {
 	bool active, input_saved;
+	size_t first_row;
 	struct termios saved_input;
 };
 
 double traffic_bytes_per_second(uint64_t delta, uint64_t elapsed_ns);
 bool traffic_display_open(struct traffic_display *display);
-/* Returns 'p', 'f', 'q', or zero; never reads redirected standard input. */
+/* Returns 'p', 'f', 'j', 'k', 'q', or zero; never reads redirected input. */
 int traffic_display_read_key(struct traffic_display *display);
 void traffic_display_render(struct traffic_display *display,
 			    const struct traffic_display_snapshot *snapshot);

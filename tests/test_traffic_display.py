@@ -57,6 +57,13 @@ int main(int argc, char **argv) {
         rows[i].tx_rate = snapshot.tx_rate;
         rows[i].idle_seconds = i ? 4 : 0;
     }
+    if (!strcmp(argv[1], "threads")) {
+        snapshot.flows = true;
+        snapshot.row_count = 2;
+        rows[0] = rows[1];
+        rows[0].pid = rows[1].pid = 1234;
+        rows[0].tid = 5678; rows[1].tid = 5679;
+    }
     if (!strcmp(argv[1], "empty")) {
         snapshot.row_count = 0;
         snapshot.rx_rate = snapshot.tx_rate = 0;
@@ -78,7 +85,14 @@ int main(int argc, char **argv) {
             if (key) {
                 fprintf(stderr, "KEY %c\n", key); fflush(stderr);
                 if (key == 'q') break;
-                snapshot.flows = key == 'f';
+                if (key == 'f' || key == 'p') {
+                    snapshot.flows = key == 'f';
+                    display.first_row = 0;
+                } else if (key == 'j') {
+                    display.first_row++;
+                } else if (key == 'k' && display.first_row) {
+                    display.first_row--;
+                }
                 traffic_display_render(&display, &snapshot);
             }
             struct timespec delay = {.tv_nsec = 10000000};
@@ -130,15 +144,15 @@ class TrafficDisplayTests(unittest.TestCase):
                                    env={**os.environ, "TERM": term})
         self.master = master
         self.pending_output = bytearray()
-        self.addCleanup(self.stop_process, process)
+        self.addCleanup(self.stop_process, process, master)
         return process, master, slave, original
 
-    def stop_process(self, process):
+    def stop_process(self, process, master):
         if process.poll() is None:
             process.terminate()
             deadline = time.monotonic() + 3
             while process.poll() is None and time.monotonic() < deadline:
-                self.drain(self.master)
+                self.drain(master)
             if process.poll() is None:
                 process.kill()
             process.wait(timeout=3)
@@ -205,9 +219,9 @@ class TrafficDisplayTests(unittest.TestCase):
         os.write(master, b"f")
         self.message(process, b"KEY f\n")
         visible = self.assert_frame_fits(self.drain(master), 44, 45)
-        self.assertIn(b"FLOW VIEW", visible)
-        self.assertIn(b"L [2001:db8", visible)
-        self.assertIn(b"R [2001:db8", visible)
+        self.assertIn(b"THREAD VIEW", visible)
+        self.assertIn(b"Local  [2001:db8", visible)
+        self.assertIn(b"Remote [2001:db8", visible)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 16, 100, 0, 0))
         os.write(master, b"p")
         self.message(process, b"KEY p\n")
@@ -231,6 +245,55 @@ class TrafficDisplayTests(unittest.TestCase):
         process.wait(timeout=3)
         self.assert_restored(slave, original)
         self.assertIn(b"\x1b[?25h", self.drain(master))
+
+    def test_thread_names_and_complete_ipv6_endpoints_at_phone_and_desktop_widths(self):
+        for columns in (32, 44, 100, 110):
+            with self.subTest(columns=columns):
+                process, master, slave, original = self.start_terminal(
+                    columns=columns, mode="threads")
+                self.message(process, b"READY\n")
+                visible = self.assert_frame_fits(self.drain(master), columns, 45)
+                self.assertIn(b"THREAD VIEW", visible)
+                self.assertIn(b"download-worker", visible)
+                self.assertIn(b"5678", visible)
+                self.assertIn(b"5679", visible)
+                self.assertIn(b"1234", visible)
+                # Continuation lines must preserve every address byte and port.
+                joined = b"".join(visible.split())
+                self.assertIn(b"[2001:db8:1111:2222:3333:4444:5555:6666]:54321", joined)
+                self.assertIn(b"[2001:db8:aaaa:bbbb:cccc:dddd:eeee:ffff]:65535", joined)
+                self.assertIn(b"Local", visible)
+                self.assertIn(b"Remote", visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
+
+    def test_scroll_reaches_hidden_threads_and_view_switch_resets_position(self):
+        process, master, slave, original = self.start_terminal()
+        self.message(process, b"READY\n")
+        self.drain(master)
+        os.write(master, b"f")
+        self.message(process, b"KEY f\n")
+        self.drain(master)
+        for _ in range(11):
+            os.write(master, b"j")
+            self.message(process, b"KEY j\n")
+            visible = self.assert_frame_fits(self.drain(master), 44, 45)
+        self.assertIn(b"TID 4311 download-worker", visible)
+        self.assertIn(b"Rows 12-12/12", visible)
+        os.write(master, b"k")
+        self.message(process, b"KEY k\n")
+        self.assertIn(b"TID 4310 download-worker", self.drain(master))
+        os.write(master, b"p")
+        self.message(process, b"KEY p\n")
+        visible = self.drain(master)
+        self.assertIn(b"PROCESS VIEW", visible)
+        self.assertIn(b"Rows 1-", visible)
+        os.write(master, b"q")
+        self.message(process, b"KEY q\n")
+        process.wait(timeout=3)
+        self.assert_restored(slave, original)
 
     def test_empty_interval_and_long_warning_keep_session_totals_visible(self):
         process, master, slave, original = self.start_terminal(mode="empty", rows=20)
