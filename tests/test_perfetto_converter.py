@@ -24,6 +24,241 @@ SPEC.loader.exec_module(MODULE)
 
 
 class PerfettoConverterTest(unittest.TestCase):
+    def socket_overview_records(self) -> list[dict]:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        start = int(clock["monotonic_ns"]) + 100000
+        packets = [
+            dict(packet_id="3001", flow_id="2001", stage="ip_rcv", direction="rx"),
+            dict(packet_id="3001", flow_id="2001", stage="tcp_v4_rcv", direction="rx"),
+            dict(packet_id="3002", flow_id="0", stage="ip_output", direction="tx", tid=70, tgid=60),
+            dict(packet_id="3003", flow_id="0", stage="kfree_skb", direction="unknown",
+                 owner_socket_id="1001", dropped=True, terminal=True),
+            dict(packet_id="3004", flow_id="2001", stage="ip_output", direction="tx",
+                 socket_id="1002"),
+        ]
+        records = [clock]
+        for index, packet in enumerate(packets):
+            records.append(dict(dict(type="packet_event", ts_ns=start + index,
+                                     tid=0, tgid=0, task="swapper/0", proto_l4=6), **packet))
+        # Ownership and relationship evidence can arrive after an early packet.
+        records += [
+            dict(type="socket_create", ts_ns=start + 10, start_ts_ns=start - 10,
+                 socket_id="0000000000001001", tid=70, tgid=60, task="app"),
+            dict(type="socket_create", ts_ns=start + 11, start_ts_ns=start - 10,
+                 socket_id="1002", tid=90, tgid=90, task="other-app"),
+            dict(type="socket_flow_link", ts_ns=start + 12, socket_id="1001",
+                 flow_id="2001", flow_tag="tcp-1"),
+            dict(type="packet_io_link", ts_ns=start + 13, socket_id="1001",
+                 packet_id="3002", flow_id="0", io_id="0", call_id="0", direction="tx"),
+        ]
+        return records
+
+    def test_socket_overview_preserves_sources_and_uses_only_explicit_id_evidence(self) -> None:
+        records = self.socket_overview_records()
+        # The last direct observation takes precedence for its event, but does
+        # not allow that ambiguous flow to assign the first two packets.
+        records[5]["flow_id"] = "0"
+        trace = Trace()
+        trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+        originals = [p for p in trace.packet if p.HasField("track_event")
+                     and any(c in p.track_event.categories
+                             for c in ("anettrace.packet", "anettrace.packet.drop"))]
+        mirrors = [p for p in trace.packet if p.HasField("track_event")
+                   and "anettrace.socket.packet" in p.track_event.categories]
+        self.assertEqual(len(originals), 5)
+        self.assertEqual(len(mirrors), 5)
+        descriptors = {p.track_descriptor.uuid: p.track_descriptor for p in trace.packet
+                       if p.HasField("track_descriptor")}
+        navigation_ids = set()
+        for source, mirror, record in zip(originals, mirrors, records[1:6]):
+            original, event = source.track_event, mirror.track_event
+            args = {a.name: a.string_value for a in event.debug_annotations}
+            self.assertEqual(mirror.timestamp, source.timestamp)
+            self.assertEqual(event.name, original.name)
+            self.assertEqual(event.type, TrackEvent.TYPE_INSTANT)
+            self.assertFalse(event.flow_ids)
+            self.assertEqual(len(event.terminating_flow_ids), 1)
+            navigation_id = event.terminating_flow_ids[0]
+            self.assertIn(navigation_id, original.flow_ids)
+            self.assertNotEqual(navigation_id, MODULE.id_value(record["packet_id"]))
+            navigation_ids.add(navigation_id)
+            for key, value in (("source_tid", record["tid"]), ("source_tgid", record["tgid"]),
+                               ("source_ts_ns", record["ts_ns"]),
+                               ("source_track_uuid", f"{original.track_uuid:016x}")):
+                self.assertEqual(args[key], str(value))
+            overview_track = descriptors[event.track_uuid]
+            expected_name = {"rx": "RX packets", "tx": "TX packets"}.get(
+                record["direction"], "Unknown direction packets")
+            self.assertEqual(overview_track.name, expected_name)
+            socket_track = descriptors[overview_track.parent_uuid]
+            owner = descriptors[socket_track.parent_uuid]
+            self.assertEqual(owner.process.pid, 90 if record["packet_id"] == "3004" else 60)
+            self.assertNotIn("swapper", owner.name)
+        self.assertEqual(len(navigation_ids), 5)
+
+    def test_socket_overview_ambiguous_relations_do_not_guess(self) -> None:
+        records = self.socket_overview_records()
+        start = records[1]["ts_ns"]
+        records += [
+            dict(type="packet_event", ts_ns=start + 20, packet_id="5001", flow_id="0",
+                 stage="ip_rcv", direction="rx", proto_l4=6),
+            dict(type="packet_io_link", ts_ns=start + 21, packet_id="5001", socket_id="1001", direction="rx"),
+            dict(type="packet_io_link", ts_ns=start + 22, packet_id="5001", socket_id="1002", direction="rx"),
+            dict(type="packet_event", ts_ns=start + 23, packet_id="5002", flow_id="0",
+                 stage="ip_rcv", direction="rx", proto_l4=6),
+        ]
+        trace = Trace()
+        trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+        mirrors = [p.track_event for p in trace.packet if p.HasField("track_event")
+                   and "anettrace.socket.packet" in p.track_event.categories]
+        args = [{a.name: a.string_value for a in event.debug_annotations} for event in mirrors]
+        self.assertEqual({a["packet_id"] for a in args}, {"3002", "3003", "3004"})
+        direct = next(a for a in args if a["packet_id"] == "3004")
+        self.assertEqual(int(direct["socket_id"], 16), 0x1002)
+
+    def test_socket_overview_exact_packet_evidence_wins_over_ambiguous_flow(self) -> None:
+        records = self.socket_overview_records()
+        records.append(dict(type="packet_io_link", ts_ns=records[1]["ts_ns"] + 30,
+                            packet_id="3001", socket_id="1001", direction="rx"))
+        trace = Trace()
+        trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+        args = [{a.name: a.string_value for a in p.track_event.debug_annotations}
+                for p in trace.packet if p.HasField("track_event")
+                and "anettrace.socket.packet" in p.track_event.categories]
+        exact = [a for a in args if a["packet_id"] == "3001"]
+        self.assertEqual(len(exact), 2)
+        self.assertEqual({int(a["socket_id"], 16) for a in exact}, {0x1001})
+
+    def test_socket_overview_loopback_packet_evidence_is_scoped_to_direction(self) -> None:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        start = int(clock["monotonic_ns"]) + 100000
+        records = [clock]
+        for index, (direction, socket, stage) in enumerate((
+            ("tx", "0", "ip_output"), ("rx", "0", "ip_rcv"),
+            ("tx", "1001", "dev_hard_start_xmit"), ("rx", "1002", "tcp_v4_rcv"),
+            ("unknown", "0", "consume_skb"),
+        )):
+            records.append(dict(type="packet_event", ts_ns=start + index,
+                                packet_id="3001", flow_id="0", socket_id=socket,
+                                direction=direction, stage=stage, proto_l4=6))
+        # A TX-only observation must not assign an unassociated RX or unknown stage.
+        records += [dict(record, packet_id="3002", ts_ns=record["ts_ns"] + 10)
+                    for record in records[1:] if record["socket_id"] != "1002"]
+        trace = Trace()
+        trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+        args = [{a.name: a.string_value for a in p.track_event.debug_annotations}
+                for p in trace.packet if p.HasField("track_event")
+                and "anettrace.socket.packet" in p.track_event.categories]
+        self.assertEqual(len(args), 6)
+        for arg in args:
+            self.assertIn(arg["direction"], ("tx", "rx"))
+            expected = 0x1001 if arg["direction"] == "tx" else 0x1002
+            self.assertEqual(int(arg["socket_id"], 16), expected)
+        second = [a for a in args if a["packet_id"] == "3002"]
+        self.assertEqual({a["direction"] for a in second}, {"tx"})
+
+    def test_socket_overview_flow_fallback_checks_the_local_endpoint(self) -> None:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        start = int(clock["monotonic_ns"]) + 100000
+        for flow_addr, packet_addr in (
+            ("127.0.0.1", "127.0.0.1"),
+            ("2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"),
+        ):
+            with self.subTest(address=flow_addr):
+                records = [clock, dict(type="flow_start", ts_ns=start - 1,
+                                      flow_id="2001", socket_id="1001", protocol="tcp",
+                                      local_addr=flow_addr, local_port=40000,
+                                      remote_addr=flow_addr, remote_port=443)]
+                for index, (packet, direction, socket, sport, dport) in enumerate((
+                    ("3001", "tx", "1001", 40000, 443),
+                    ("3001", "rx", "0", 40000, 443),  # same skb reaching the other local socket
+                    ("3002", "rx", "0", 40000, 443),  # a cloned skb has the same endpoint mismatch
+                    ("3003", "tx", "0", 40000, 443),
+                    ("3004", "rx", "0", 443, 40000),  # reply belongs to the original local endpoint
+                    ("3005", "unknown", "0", 40000, 443),
+                )):
+                    records.append(dict(type="packet_event", ts_ns=start + index,
+                                        packet_id=packet, flow_id="2001", socket_id=socket,
+                                        direction=direction, stage="packet_stage", proto_l4=6,
+                                        saddr=packet_addr, sport=sport, daddr=packet_addr, dport=dport))
+                trace = Trace()
+                trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+                args = [{a.name: a.string_value for a in p.track_event.debug_annotations}
+                        for p in trace.packet if p.HasField("track_event")
+                        and "anettrace.socket.packet" in p.track_event.categories]
+                self.assertEqual({(a["packet_id"], a["direction"]) for a in args},
+                                 {("3001", "tx"), ("3003", "tx"), ("3004", "rx")})
+
+    def test_socket_overview_packet_evidence_precedes_flow_endpoint_fallback(self) -> None:
+        records = self.socket_overview_records()
+        start = records[1]["ts_ns"]
+        records.append(dict(type="flow_start", ts_ns=start - 1, flow_id="2001", socket_id="1002",
+                            protocol="tcp", local_addr="10.0.0.1", local_port=40000))
+        records[1].update(saddr="10.0.0.1", sport=40000, daddr="10.0.0.2", dport=443)
+        records.append(dict(type="packet_io_link", ts_ns=start + 30, packet_id="3001",
+                            socket_id="1001", direction="rx"))
+        trace = Trace()
+        trace.ParseFromString(MODULE.PerfettoExporter(records).serialize())
+        args = [{a.name: a.string_value for a in p.track_event.debug_annotations}
+                for p in trace.packet if p.HasField("track_event")
+                and "anettrace.socket.packet" in p.track_event.categories]
+        early = next(a for a in args if a["packet_id"] == "3001" and a["stage"] == "ip_rcv")
+        self.assertEqual(int(early["socket_id"], 16), 0x1001)
+
+    def test_socket_overview_navigation_imports_one_same_timestamp_edge_per_stage(self) -> None:
+        records = self.socket_overview_records()
+        records[5]["flow_id"] = "0"
+        encoded = MODULE.PerfettoExporter(records).serialize()
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "overview.pftrace"
+            path.write_bytes(encoded)
+            with TraceProcessor(trace=str(path)) as processor:
+                rows = list(processor.query("""
+                    SELECT source.id AS source_id, mirror.id AS mirror_id,
+                           source.ts AS source_ts, mirror.ts AS mirror_ts,
+                           source.category AS source_category,
+                           extract_arg(source.arg_set_id, 'debug.packet_id') AS source_packet,
+                           extract_arg(mirror.arg_set_id, 'debug.packet_id') AS mirror_packet
+                    FROM flow f JOIN slice source ON source.id = f.slice_out
+                    JOIN slice mirror ON mirror.id = f.slice_in
+                    WHERE mirror.category = 'anettrace.socket.packet'
+                """))
+                self.assertEqual(len(rows), 5)
+                self.assertEqual(len({r.source_id for r in rows}), 5)
+                self.assertEqual(len({r.mirror_id for r in rows}), 5)
+                for row in rows:
+                    self.assertEqual(row.source_ts, row.mirror_ts)
+                    self.assertEqual(row.source_packet, row.mirror_packet)
+                    self.assertIn(row.source_category, ("anettrace.packet", "anettrace.packet.drop"))
+                outgoing = list(processor.query("""
+                    SELECT f.id FROM flow f JOIN slice source ON source.id = f.slice_out
+                    WHERE source.category = 'anettrace.socket.packet'
+                """))
+                self.assertEqual(outgoing, [])
+
+    def test_socket_overview_does_not_parent_a_socket_to_the_receive_task(self) -> None:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        for owner in (None, 60):
+            with self.subTest(owner=owner):
+                record = dict(type="packet_event", ts_ns=int(clock["monotonic_ns"]) + 1,
+                              packet_id="3001", socket_id="1001", proto_l4=6,
+                              stage="tcp_v4_rcv", direction="rx", tid=8, tgid=8, task="ksoftirqd/0")
+                if owner:
+                    record.update(owner_valid=True, owner_tgid=owner, owner_tid=70)
+                trace = Trace()
+                trace.ParseFromString(MODULE.PerfettoExporter([clock, record]).serialize())
+                descriptors = {p.track_descriptor.uuid: p.track_descriptor for p in trace.packet
+                               if p.HasField("track_descriptor")}
+                mirror = next(p.track_event for p in trace.packet if p.HasField("track_event")
+                              and "anettrace.socket.packet" in p.track_event.categories)
+                socket_track = descriptors[descriptors[mirror.track_uuid].parent_uuid]
+                if owner:
+                    process = descriptors[socket_track.parent_uuid]
+                    self.assertEqual(process.process.pid, owner)
+                    self.assertEqual(process.name, "pid 60")
+                else:
+                    self.assertFalse(socket_track.parent_uuid)
+
     def chain_records(self) -> list[dict]:
         clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
         start = int(clock["monotonic_ns"]) + 100000
@@ -78,7 +313,9 @@ class PerfettoConverterTest(unittest.TestCase):
         packets = [e for e in events if "anettrace.packet" in e.categories]
         self.assertEqual([e.name for e in packets],
                          ["udp-1 · udp_rcv", "udp-1 · udp_rcv", "udp-2 · udp_rcv"])
-        self.assertEqual([list(e.flow_ids) for e in packets], [[0x3001], [0x3002], [0x3003]])
+        for event, packet_id in zip(packets, (0x3001, 0x3002, 0x3003)):
+            args = {a.name: a.string_value for a in event.debug_annotations}
+            self.assertEqual(set(event.flow_ids), {packet_id, MODULE.id_value(args["navigation_id"])})
         bridges = [e for e in events if "anettrace.socket.flow" in e.categories]
         self.assertEqual([set(e.flow_ids) for e in bridges],
                          [{0x1001, 0x2001}, {0x1001, 0x2002}])
@@ -178,6 +415,66 @@ class PerfettoConverterTest(unittest.TestCase):
         self.assertEqual({key: args[key] for key in ("socket_id", "io_id", "call_id")},
                          dict(socket_id="1001", io_id="4001", call_id="5001"))
         self.assertEqual(exporter.flow_label("2002", {"proto_l4": 6}), "tcp-8")
+
+    def test_icmp_echo_packets_preserve_metadata_timestamps_and_packet_paths(self) -> None:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        start = int(clock["monotonic_ns"]) + 100000
+        for protocol, label, request_type, reply_type, tx_stage, rx_stage, source, dest in (
+            (1, "icmp", 8, 0, "ip_output", "icmp_rcv", "10.0.0.2", "10.0.0.1"),
+            (58, "icmpv6", 128, 129, "ip6_output", "icmpv6_rcv", "2001:db8::2", "2001:db8::1"),
+        ):
+            with self.subTest(protocol=protocol):
+                common = dict(type="packet_event", flow_id="0", proto_l4=protocol,
+                              icmp_code=0, icmp_id=0x1234, icmp_seq=7,
+                              tid=70, tgid=60, task="ping", sport=53, dport=1234)
+                request = dict(common, ts_ns=start, packet_id="3001", stage=tx_stage,
+                               direction="tx", icmp_type=request_type, saddr=source, daddr=dest)
+                transmitted = dict(request, ts_ns=start + 1, stage="dev_hard_start_xmit",
+                                   flow_tag=label, terminal=True)
+                reply = dict(common, ts_ns=start + 2, packet_id="3002", stage=rx_stage,
+                             direction="rx", icmp_type=reply_type, saddr=dest, daddr=source)
+                records = [request, transmitted, reply]
+                trace = Trace()
+                trace.ParseFromString(MODULE.PerfettoExporter([clock] + records).serialize())
+                packets = [p for p in trace.packet if p.HasField("track_event")]
+                self.assertEqual(len(packets), 3)
+                for packet, record in zip(packets, records):
+                    event = packet.track_event
+                    args = {a.name: a.string_value for a in event.debug_annotations}
+                    self.assertEqual(event.name, f"{label} · {record['stage']}")
+                    self.assertEqual(packet.timestamp, record["ts_ns"])
+                    self.assertEqual(packet.timestamp_clock_id, MODULE.CLOCK_MONOTONIC)
+                    self.assertEqual(event.type, TrackEvent.TYPE_INSTANT)
+                    self.assertEqual(list(event.categories), ["anettrace.packet"])
+                    self.assertFalse(event.correlation_id)
+                    for key in ("proto_l4", "direction", "saddr", "daddr", "icmp_type",
+                                "icmp_code", "icmp_id", "icmp_seq"):
+                        self.assertEqual(args[key], str(record[key]))
+                    self.assertTrue({"sport", "dport"}.isdisjoint(args))
+                self.assertEqual(list(packets[0].track_event.flow_ids), [0x3001])
+                self.assertEqual(list(packets[1].track_event.terminating_flow_ids), [0x3001])
+                self.assertEqual(list(packets[2].track_event.flow_ids), [0x3002])
+
+    def test_icmp_errors_and_neighbor_discovery_do_not_display_echo_fields(self) -> None:
+        clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
+        start = int(clock["monotonic_ns"]) + 100000
+        for protocol, label, icmp_type, icmp_code in (
+            (1, "icmp", 3, 1), (1, "icmp", 11, 0),
+            (58, "icmpv6", 1, 4), (58, "icmpv6", 135, 0),
+        ):
+            with self.subTest(protocol=protocol, icmp_type=icmp_type):
+                record = dict(type="packet_event", ts_ns=start, packet_id="3001",
+                              flow_id="0", proto_l4=protocol, stage="netif_receive_skb",
+                              direction="rx", icmp_type=icmp_type, icmp_code=icmp_code,
+                              icmp_id=0xDEAD, icmp_seq=0xBEEF, sport=53, dport=1234)
+                trace = Trace()
+                trace.ParseFromString(MODULE.PerfettoExporter([clock, record]).serialize())
+                event = next(p.track_event for p in trace.packet if p.HasField("track_event"))
+                args = {a.name: a.string_value for a in event.debug_annotations}
+                self.assertEqual(event.name, f"{label} · netif_receive_skb")
+                self.assertEqual(args["icmp_type"], str(icmp_type))
+                self.assertEqual(args["icmp_code"], str(icmp_code))
+                self.assertTrue({"sport", "dport", "icmp_id", "icmp_seq"}.isdisjoint(args))
 
     def test_incomplete_protocol_read_duration_has_no_success_result(self) -> None:
         clock = MODULE.read_records(ROOT / "tests/fixtures/perfetto-events.jsonl")[0]
@@ -448,7 +745,9 @@ int main(void) {
             if annotations["stage"].string_value == "__tcp_transmit_skb"
         ]
         self.assertEqual(len(tx_packets), 1)
-        self.assertEqual(list(tx_packets[0].flow_ids), [0x3001])
+        tx_annotations = {a.name: a.string_value for a in tx_packets[0].debug_annotations}
+        self.assertEqual(set(tx_packets[0].flow_ids),
+                         {0x3001, MODULE.id_value(tx_annotations["navigation_id"])})
 
         rx_packets = [
             event
@@ -456,7 +755,9 @@ int main(void) {
             if annotations["stage"].string_value == "tcp_v4_rcv"
         ]
         self.assertEqual(len(rx_packets), 1)
-        self.assertEqual(list(rx_packets[0].flow_ids), [0x3002])
+        rx_args = {a.name: a.string_value for a in rx_packets[0].debug_annotations}
+        self.assertEqual(set(rx_packets[0].flow_ids),
+                         {0x3002, MODULE.id_value(rx_args["navigation_id"])})
         rx_annotations = {
             annotation.name: annotation
             for annotation in rx_packets[0].debug_annotations
@@ -987,7 +1288,11 @@ int main(void) {
                     )
                 )
                 flow_link_rows = list(
-                    processor.query("SELECT COUNT(*) AS count FROM flow")
+                    processor.query("""
+                        SELECT COUNT(*) AS count FROM flow f
+                        JOIN slice target ON target.id = f.slice_in
+                        WHERE target.category != 'anettrace.socket.packet'
+                    """)
                 )
 
         expected_by_tag = {

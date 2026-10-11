@@ -39,6 +39,8 @@ events AS (
   LEFT JOIN thread_track ptt ON ptt.id = tr.parent_id
   LEFT JOIN thread pt ON pt.utid = ptt.utid
   WHERE s.category GLOB 'anettrace*'
+    -- Socket packet lanes mirror the thread events; return each observation once.
+    AND s.category != 'anettrace.socket.packet'
 ),
 raw_ids AS (
   SELECT id, 'packet_id' AS kind, packet_id AS value FROM events

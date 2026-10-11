@@ -27,6 +27,10 @@
 #define UDP_FLOW_IDLE_NS (30ULL * 1000 * 1000 * 1000)
 #define NATIVE_PACKET_SEQUENCE_ID 0xa11e7001U
 #define NATIVE_RING_MAX_BYTES (64ULL * 1024 * 1024)
+#define NATIVE_OVERVIEW_WINDOW_NS 1000000000ULL
+#define NATIVE_OVERVIEW_MAX_EVENTS 4096
+#define NATIVE_OVERVIEW_MAX_BYTES (8ULL * 1024 * 1024)
+#define NATIVE_OVERVIEW_PACKET_SLOTS 8192
 
 static FILE *export_file;
 static FILE *native_file;
@@ -42,6 +46,7 @@ enum native_track_kind {
 	NATIVE_TRACK_PROCESS,
 	NATIVE_TRACK_THREAD,
 	NATIVE_TRACK_SOCKET,
+	NATIVE_TRACK_SOCKET_PACKETS,
 	NATIVE_TRACK_FLOW,
 	NATIVE_TRACK_CONNECT,
 	NATIVE_TRACK_SYSCALL,
@@ -105,6 +110,8 @@ struct flow_state {
 	char task[16];
 	bool active;
 	bool closed;
+	bool owner_valid;
+	bool socket_ambiguous;
 };
 
 struct proto_buffer {
@@ -126,6 +133,35 @@ struct native_packet_queue {
 	struct native_packet *tail;
 	size_t bytes;
 };
+
+/* Delay only packet events, in arrival order, to learn RX ownership from
+ * later stack stages. Both time and memory are bounded; pressure flushes
+ * originals even when a socket overview cannot yet be produced. */
+struct native_packet_overview {
+	struct native_packet_overview *next;
+	struct proto_buffer event;
+	size_t annotation_offset, annotation_size;
+	u64 timestamp_ns, packet_id, flow_id, socket_id, source_track_uuid;
+	u32 source_tid, source_tgid, owner_tgid;
+	u8 direction;
+	u16 local_port;
+	char local_addr[INET6_ADDRSTRLEN];
+	char name[128];
+};
+
+struct native_packet_owner {
+	u64 packet_id, socket_id, timestamp_ns;
+	u32 owner_tgid;
+	u8 direction;
+	bool ambiguous, collided;
+};
+
+static struct native_packet_overview *native_overview_head, *native_overview_tail;
+static size_t native_overview_count, native_overview_bytes;
+static struct native_packet_owner native_packet_owners[NATIVE_OVERVIEW_PACKET_SLOTS];
+static u64 native_overview_latest_ns, native_navigation_serial;
+static u64 native_overview_emitted, native_overview_unresolved;
+static u64 native_overview_ambiguous, native_overview_capacity_flushes;
 
 static struct native_track *native_tracks;
 static size_t native_track_count;
@@ -517,6 +553,7 @@ static struct native_track *native_thread_track(u32 tgid, u32 tid,
 	u64 uuid = native_uuid("thread", tgid, tid);
 	struct native_track *track = native_find_track(uuid);
 	struct native_track *process;
+	u64 parent_uuid;
 	char fallback[32];
 
 	if (track)
@@ -524,6 +561,7 @@ static struct native_track *native_thread_track(u32 tgid, u32 tid,
 	process = native_process_track(tgid, task);
 	if (!process)
 		return NULL;
+	parent_uuid = process->uuid;
 	if (!task || !task[0]) {
 		snprintf(fallback, sizeof(fallback), "tid %u", tid);
 		task = fallback;
@@ -531,7 +569,7 @@ static struct native_track *native_thread_track(u32 tgid, u32 tid,
 	track = native_add_track(uuid, ((u64)tgid << 32) | tid,
 				 NATIVE_TRACK_THREAD);
 	if (track)
-		native_descriptor(uuid, task, process->uuid, NATIVE_TRACK_THREAD,
+		native_descriptor(uuid, task, parent_uuid, NATIVE_TRACK_THREAD,
 				  tgid, tid);
 	return track;
 }
@@ -542,18 +580,24 @@ static struct native_track *native_socket_track(u64 socket_id, u32 tgid,
 	u64 uuid = native_uuid("socket", socket_id, 0);
 	struct native_track *track = native_find_track(uuid);
 	struct native_track *process;
+	u64 parent_uuid = 0;
 	char name[32];
 
 	if (track)
 		return track;
-	process = native_process_track(tgid, task);
-	if (!process)
-		return NULL;
+	/* Socket ownership must not come from a packet's softirq context. */
+	if (tgid) {
+		process = native_process_track(tgid, task);
+		if (!process)
+			return NULL;
+		parent_uuid = process->uuid;
+	}
 	snprintf(name, sizeof(name), "socket %08llx", socket_id & 0xffffffffULL);
 	track = native_add_track(uuid, socket_id, NATIVE_TRACK_SOCKET);
-	if (track)
-		native_descriptor(uuid, name, process->uuid, NATIVE_TRACK_SOCKET,
+	if (track) {
+		native_descriptor(uuid, name, parent_uuid, NATIVE_TRACK_SOCKET,
 				  tgid, 0);
+	}
 	return track;
 }
 
@@ -563,6 +607,7 @@ static struct native_track *native_connect_track(u64 attempt_id, u32 tgid,
 	u64 uuid = native_uuid("connect", attempt_id, 0);
 	struct native_track *track = native_find_track(uuid);
 	struct native_track *thread;
+	u64 parent_uuid;
 	char name[32];
 
 	if (track)
@@ -570,11 +615,12 @@ static struct native_track *native_connect_track(u64 attempt_id, u32 tgid,
 	thread = native_thread_track(tgid, tid, task);
 	if (!thread)
 		return NULL;
+	parent_uuid = thread->uuid;
 	snprintf(name, sizeof(name), "connect %08llx",
 		 attempt_id & 0xffffffffULL);
 	track = native_add_track(uuid, attempt_id, NATIVE_TRACK_CONNECT);
 	if (track)
-		native_descriptor(uuid, name, thread->uuid, NATIVE_TRACK_CONNECT,
+		native_descriptor(uuid, name, parent_uuid, NATIVE_TRACK_CONNECT,
 				  tgid, tid);
 	return track;
 }
@@ -1091,6 +1137,20 @@ static u64 detail_flow_id(const detail_event_t *detail, bool socket)
 	return flow ? flow->id : 0;
 }
 
+static bool packet_is_icmp(const packet_t *pkt)
+{
+	return pkt->proto_l4 == IPPROTO_ICMP || pkt->proto_l4 == IPPROTO_ICMPV6;
+}
+
+static bool packet_is_icmp_echo(const packet_t *pkt)
+{
+	/* Only Echo Request/Reply headers define an identifier and sequence. */
+	return (pkt->proto_l4 == IPPROTO_ICMP &&
+		(pkt->l4.icmp.type == 8 || pkt->l4.icmp.type == 0)) ||
+	       (pkt->proto_l4 == IPPROTO_ICMPV6 &&
+		(pkt->l4.icmp.type == 128 || pkt->l4.icmp.type == 129));
+}
+
 static const char *flow_label_prefix(u8 protocol, u16 local_port,
 				     u16 remote_port)
 {
@@ -1130,6 +1190,11 @@ static void format_packet_flow_label(u64 flow_id, const packet_t *pkt,
 {
 	struct flow_state *flow = flow_find_any(flow_id);
 
+	if (packet_is_icmp(pkt)) {
+		snprintf(label, size, "%s",
+			 pkt->proto_l4 == IPPROTO_ICMP ? "icmp" : "icmpv6");
+		return;
+	}
 	if (flow) {
 		format_flow_label(flow, label, size);
 		return;
@@ -1179,25 +1244,27 @@ static struct native_track *native_flow_track(struct flow_state *flow)
 {
 	struct native_track *track, *parent;
 	char tag[16], name[160];
-	u64 uuid;
+	u64 uuid, parent_uuid;
 
 	uuid = native_uuid("flow", flow->id, 0);
 	track = native_find_track(uuid);
 	if (track)
 		return track;
 	parent = flow->socket_id ?
-		 native_socket_track(flow->socket_id, flow->owner_tgid,
-				     flow->task) :
+		 native_socket_track(flow->socket_id,
+				     flow->owner_valid ? flow->owner_tgid : 0,
+				     flow->owner_valid ? flow->task : NULL) :
 		 native_process_track(flow->owner_tgid, flow->task);
 	if (!parent)
 		return NULL;
+	parent_uuid = parent->uuid;
 	format_flow_label(flow, tag, sizeof(tag));
 	snprintf(name, sizeof(name), "%s %s %s:%u -> %s:%u", tag,
 		 flow_protocol_name(flow), flow->local_addr, flow->local_port,
 		 flow->remote_addr, flow->remote_port);
 	track = native_add_track(uuid, flow->id, NATIVE_TRACK_FLOW);
 	if (track)
-		native_descriptor(uuid, name, parent->uuid, NATIVE_TRACK_FLOW,
+		native_descriptor(uuid, name, parent_uuid, NATIVE_TRACK_FLOW,
 				  flow->owner_tgid, 0);
 	return track;
 }
@@ -1224,7 +1291,9 @@ static void flow_link_socket(struct flow_state *flow, u64 timestamp_ns)
 			flow->owner_tid, flow->owner_tgid, flow->owner_uid, task);
 	if (!native_file)
 		return;
-	socket = native_socket_track(flow->socket_id, flow->owner_tgid, flow->task);
+	socket = native_socket_track(flow->socket_id,
+		flow->owner_valid ? flow->owner_tgid : 0,
+		flow->owner_valid ? flow->task : NULL);
 	if (!socket)
 		return;
 	snprintf(name, sizeof(name), "socket associated · %s", tag);
@@ -1364,9 +1433,15 @@ static void flow_set_owner(struct flow_state *flow,
 			   const detail_event_t *detail, const event_t *event,
 			   u64 socket_id)
 {
-	if (socket_id)
+	if (socket_id) {
+		if (flow->socket_id && flow->socket_id != socket_id)
+			flow->socket_ambiguous = true;
 		flow->socket_id = socket_id;
+	}
 	if (detail->owner_valid) {
+		if (!flow->owner_valid || flow->owner_tgid != detail->owner_tgid)
+			flow->task[0] = '\0';
+		flow->owner_valid = true;
 		flow->owner_tid = detail->owner_tid;
 		flow->owner_tgid = detail->owner_tgid;
 		flow->owner_uid = detail->owner_uid;
@@ -1431,6 +1506,8 @@ static struct flow_state *flow_from_socket(const detail_event_t *detail,
 
 static bool flow_packet_anchor(const trace_t *trace, u8 protocol, u8 direction)
 {
+	if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP)
+		return false;
 	if (direction == PACKET_DIRECTION_TX) {
 		if (protocol == IPPROTO_TCP) {
 			if (trace_ctx.args.trace_detail ||
@@ -1936,14 +2013,18 @@ static void native_export_socket_create(const detail_event_t *detail,
 {
 	const event_t *event = (const void *)detail;
 	u64 socket_id = socket_instance_id(event->key, event->key_generation);
+	u64 thread_uuid;
 	struct native_track *thread, *socket;
 	struct proto_buffer allocation = {};
 
 	thread = native_thread_track(event->tgid, event->tid, detail->task);
-	socket = native_socket_track(socket_id, event->tgid, detail->task);
-	if (!thread || !socket)
+	if (!thread)
 		return;
-	native_event_start(&allocation, 1, thread->uuid, "socket allocation",
+	thread_uuid = thread->uuid;
+	socket = native_socket_track(socket_id, event->tgid, detail->task);
+	if (!socket)
+		return;
+	native_event_start(&allocation, 1, thread_uuid, "socket allocation",
 			   "anettrace.socket");
 	native_event_flow(&allocation, socket_id, false);
 	native_annotation_id(&allocation, "socket_id", socket_id);
@@ -1951,7 +2032,7 @@ static void native_export_socket_create(const detail_event_t *detail,
 	native_annotation_uint(&allocation, "uid", event->uid);
 	native_event_write(start_ts, &allocation);
 	proto_free(&allocation);
-	native_slice(event->ske.ts, thread->uuid, 2, NULL, "anettrace.socket",
+	native_slice(event->ske.ts, thread_uuid, 2, NULL, "anettrace.socket",
 		     socket_id, false);
 	if (socket->active)
 		native_close_socket(socket, start_ts);
@@ -1970,7 +2051,9 @@ static void native_export_socket_state(const detail_event_t *detail,
 	char source[INET6_ADDRSTRLEN], dest[INET6_ADDRSTRLEN], name[64];
 	bool terminal = newstate == TCP_CLOSE;
 
-	socket = native_socket_track(socket_id, event->tgid, detail->task);
+	socket = native_socket_track(socket_id,
+		detail->owner_valid ? detail->owner_tgid : 0,
+		detail->owner_valid && detail->owner_tgid == event->tgid ? detail->task : NULL);
 	if (!socket)
 		return;
 	if (!terminal)
@@ -2008,6 +2091,7 @@ static void native_export_socket_event(const detail_event_t *detail,
 	u64 flow_id = detail_flow_id(detail, true);
 	char tag[16];
 	u64 socket_id = socket_instance_id(event->key, event->key_generation);
+	u64 thread_uuid;
 	struct native_track *thread, *socket;
 	struct proto_buffer track_event = {};
 	char source[INET6_ADDRSTRLEN], dest[INET6_ADDRSTRLEN];
@@ -2015,13 +2099,18 @@ static void native_export_socket_event(const detail_event_t *detail,
 	bool terminal = socket_trace_terminal(trace);
 
 	thread = native_thread_track(event->tgid, event->tid, detail->task);
-	socket = native_socket_track(socket_id, event->tgid, detail->task);
-	if (!thread || !socket)
+	if (!thread)
+		return;
+	thread_uuid = thread->uuid;
+	socket = native_socket_track(socket_id,
+		detail->owner_valid ? detail->owner_tgid : 0,
+		detail->owner_valid && detail->owner_tgid == event->tgid ? detail->task : NULL);
+	if (!socket)
 		return;
 	if (!terminal)
 		native_open_socket(socket, event->ske.ts);
 	socket_addresses(&event->ske, source, sizeof(source), dest, sizeof(dest));
-	native_event_start(&track_event, 3, thread->uuid, stage,
+	native_event_start(&track_event, 3, thread_uuid, stage,
 			   "anettrace.socket");
 	native_event_flow(&track_event, socket_id, terminal);
 	native_annotation_id(&track_event, "socket_id", socket_id);
@@ -2057,6 +2146,240 @@ static void native_export_socket_event(const detail_event_t *detail,
 		native_close_socket(socket, event->ske.ts);
 }
 
+static struct native_track *native_socket_packet_track(u64 socket_id,
+						       u32 owner_tgid, u8 direction)
+{
+	u64 uuid = native_uuid("socket-packets", socket_id, direction);
+	struct native_track *track = native_find_track(uuid), *socket;
+	u64 parent_uuid;
+	const char *name = direction == PACKET_DIRECTION_TX ? "TX packets" :
+		direction == PACKET_DIRECTION_RX ? "RX packets" : "Unknown direction packets";
+
+	if (track)
+		return track;
+	socket = native_socket_track(socket_id, owner_tgid, NULL);
+	if (!socket)
+		return NULL;
+	parent_uuid = socket->uuid;
+	track = native_add_track(uuid, socket_id, NATIVE_TRACK_SOCKET_PACKETS);
+	if (track)
+		native_descriptor(uuid, name, parent_uuid, NATIVE_TRACK_SOCKET_PACKETS, 0, 0);
+	return track;
+}
+
+static void native_packet_overview_flush_one(void)
+{
+	struct native_packet_overview *pending = native_overview_head;
+	struct native_packet_owner *owner;
+	struct flow_state *flow;
+	struct native_track *lane = NULL;
+	struct proto_buffer mirror = {};
+	u64 socket_id, navigation_id = 0;
+	u32 owner_tgid;
+	bool ambiguous = false, evidence_unavailable;
+
+	if (!pending)
+		return;
+	native_overview_bytes -= pending->event.capacity;
+	socket_id = pending->socket_id;
+	owner_tgid = pending->owner_tgid;
+	owner = &native_packet_owners[native_uuid("packet-owner", pending->packet_id,
+		pending->direction) % NATIVE_OVERVIEW_PACKET_SLOTS];
+	evidence_unavailable = owner->packet_id && (owner->collided ||
+		owner->packet_id != pending->packet_id || owner->direction != pending->direction);
+	if (!socket_id && owner->packet_id == pending->packet_id &&
+	    owner->direction == pending->direction &&
+	    owner->timestamp_ns <= pending->timestamp_ns + NATIVE_OVERVIEW_WINDOW_NS &&
+	    pending->timestamp_ns <= owner->timestamp_ns + NATIVE_OVERVIEW_WINDOW_NS) {
+		ambiguous = owner->ambiguous;
+		if (!ambiguous && !evidence_unavailable) {
+			socket_id = owner->socket_id;
+			owner_tgid = owner->owner_tgid;
+		}
+	}
+	flow = flow_find_any(pending->flow_id);
+	/* A bidirectional tuple may also connect two local sockets. Only use a
+	 * flow whose local endpoint agrees with this packet's observed direction. */
+	if (!socket_id && !ambiguous && !evidence_unavailable && flow &&
+	    pending->direction != PACKET_DIRECTION_UNKNOWN &&
+	    pending->local_port == flow->local_port &&
+	    !strcmp(pending->local_addr, flow->local_addr)) {
+		ambiguous = flow->socket_ambiguous;
+		if (!ambiguous) {
+			socket_id = flow->socket_id;
+			owner_tgid = flow->owner_valid ? flow->owner_tgid : 0;
+		}
+	}
+	if (socket_id)
+		lane = native_socket_packet_track(socket_id, owner_tgid, pending->direction);
+	if (lane) {
+		navigation_id = native_uuid("packet-navigation", ++native_navigation_serial, 0);
+		native_event_flow(&pending->event, navigation_id, false);
+		native_annotation_id(&pending->event, "navigation_id", navigation_id);
+		native_event_start(&mirror, 3, lane->uuid, pending->name, "anettrace.socket.packet");
+		native_event_flow(&mirror, navigation_id, true);
+		proto_bytes(&mirror, pending->event.data + pending->annotation_offset,
+			    pending->annotation_size);
+		native_annotation_id(&mirror, "socket_id", socket_id);
+		native_annotation_id(&mirror, "navigation_id", navigation_id);
+		native_annotation_uint(&mirror, "source_tid", pending->source_tid);
+		native_annotation_uint(&mirror, "source_tgid", pending->source_tgid);
+		native_annotation_uint(&mirror, "source_ts_ns", pending->timestamp_ns);
+		native_annotation_id(&mirror, "source_track_uuid", pending->source_track_uuid);
+		native_overview_emitted++;
+	} else if (ambiguous) {
+		native_overview_ambiguous++;
+	} else {
+		native_overview_unresolved++;
+	}
+	/* Arrival order is preserved, with each mirror after its original at the
+	 * same timestamp. Dedicated navigation ids never enter packet chains. */
+	native_event_write(pending->timestamp_ns, &pending->event);
+	if (lane)
+		native_event_write(pending->timestamp_ns, &mirror);
+	proto_free(&mirror);
+	native_overview_head = pending->next;
+	if (!native_overview_head)
+		native_overview_tail = NULL;
+	native_overview_count--;
+	proto_free(&pending->event);
+	free(pending);
+}
+
+static void native_packet_overview_flush(u64 timestamp_ns, bool all)
+{
+	if (timestamp_ns > native_overview_latest_ns)
+		native_overview_latest_ns = timestamp_ns;
+	while (native_overview_head &&
+	       (all || (native_overview_latest_ns >= NATIVE_OVERVIEW_WINDOW_NS &&
+			native_overview_head->timestamp_ns <=
+			native_overview_latest_ns - NATIVE_OVERVIEW_WINDOW_NS)))
+		native_packet_overview_flush_one();
+}
+
+static bool native_packet_overview_slot_pending(size_t slot)
+{
+	struct native_packet_overview *pending;
+
+	for (pending = native_overview_head; pending; pending = pending->next)
+		if (native_uuid("packet-owner", pending->packet_id, pending->direction) %
+		    NATIVE_OVERVIEW_PACKET_SLOTS == slot)
+			return true;
+	return false;
+}
+
+static void native_packet_overview_observe(const detail_event_t *detail)
+{
+	struct native_packet_owner *owner;
+	u64 id, socket_id;
+	size_t slot;
+
+	if (!native_file)
+		return;
+	if (!detail->key_generation)
+		goto flush;
+	id = packet_id(&detail->pkt, detail->key, detail->key_generation);
+	slot = native_uuid("packet-owner", id, detail->direction) % NATIVE_OVERVIEW_PACKET_SLOTS;
+	owner = &native_packet_owners[slot];
+	if (owner->packet_id && detail->pkt.ts > owner->timestamp_ns + NATIVE_OVERVIEW_WINDOW_NS) {
+		/* Flush references before expiry. A newer FIFO head can hold an
+		 * older event behind it, so keep any bucket still referenced. */
+		native_packet_overview_flush(detail->pkt.ts, false);
+		if (!native_packet_overview_slot_pending(slot))
+			memset(owner, 0, sizeof(*owner));
+	}
+	if (!detail->owner_socket_key)
+		goto flush;
+	socket_id = socket_instance_id(detail->owner_socket_key, detail->owner_socket_generation);
+	if (owner->packet_id != id || owner->direction != detail->direction) {
+		/* Do not evict live conflict evidence. A collision may omit an
+		 * optional overview, but must never turn ambiguity into a guess. */
+		if (owner->packet_id) {
+			owner->collided = true;
+			if (detail->pkt.ts > owner->timestamp_ns)
+				owner->timestamp_ns = detail->pkt.ts;
+			goto flush;
+		}
+		*owner = (struct native_packet_owner) {
+			.packet_id=id, .socket_id=socket_id, .direction=detail->direction};
+	} else if (owner->socket_id != socket_id) {
+		owner->ambiguous = true;
+	}
+	if (detail->pkt.ts > owner->timestamp_ns)
+		owner->timestamp_ns = detail->pkt.ts;
+	if (detail->owner_valid)
+		owner->owner_tgid = detail->owner_tgid;
+flush:
+	native_packet_overview_flush(detail->pkt.ts, false);
+}
+
+static void native_packet_overview_queue(const detail_event_t *detail, u64 flow_id,
+		u64 thread_uuid, const char *name, struct proto_buffer *event,
+		size_t annotation_offset, size_t annotation_size)
+{
+	struct native_packet_overview *pending;
+	char source[INET6_ADDRSTRLEN], dest[INET6_ADDRSTRLEN];
+
+	while (native_overview_head &&
+	       (native_overview_count >= NATIVE_OVERVIEW_MAX_EVENTS ||
+		native_overview_bytes + event->capacity > NATIVE_OVERVIEW_MAX_BYTES)) {
+		native_overview_capacity_flushes++;
+		native_packet_overview_flush_one();
+	}
+	pending = event->capacity <= NATIVE_OVERVIEW_MAX_BYTES ? calloc(1, sizeof(*pending)) : NULL;
+	if (!pending) {
+		/* Preserve original packet evidence if the optional view cannot fit. */
+		native_packet_overview_flush(0, true);
+		native_event_write(detail->pkt.ts, event);
+		native_overview_unresolved++;
+		return;
+	}
+	pending->event = *event;
+	memset(event, 0, sizeof(*event));
+	pending->annotation_offset = annotation_offset;
+	pending->annotation_size = annotation_size;
+	pending->timestamp_ns = detail->pkt.ts;
+	pending->packet_id = packet_id(&detail->pkt, detail->key, detail->key_generation);
+	pending->flow_id = flow_id;
+	pending->socket_id = detail->owner_socket_key ?
+		socket_instance_id(detail->owner_socket_key, detail->owner_socket_generation) : 0;
+	pending->owner_tgid = detail->owner_valid ? detail->owner_tgid : 0;
+	pending->source_track_uuid = thread_uuid;
+	pending->source_tid = detail->tid;
+	pending->source_tgid = detail->tgid;
+	pending->direction = detail->direction;
+	packet_addresses(&detail->pkt, source, sizeof(source), dest, sizeof(dest));
+	snprintf(pending->local_addr, sizeof(pending->local_addr), "%s",
+		detail->direction == PACKET_DIRECTION_RX ? dest : source);
+	pending->local_port = ntohs(detail->direction == PACKET_DIRECTION_RX ?
+		detail->pkt.l4.min.dport : detail->pkt.l4.min.sport);
+	snprintf(pending->name, sizeof(pending->name), "%s", name);
+	if (native_overview_tail)
+		native_overview_tail->next = pending;
+	else
+		native_overview_head = pending;
+	native_overview_tail = pending;
+	native_overview_count++;
+	native_overview_bytes += pending->event.capacity;
+	native_packet_overview_flush(native_overview_latest_ns, false);
+}
+
+static void native_packet_overview_reset(void)
+{
+	while (native_overview_head) {
+		struct native_packet_overview *next = native_overview_head->next;
+		proto_free(&native_overview_head->event);
+		free(native_overview_head);
+		native_overview_head = next;
+	}
+	native_overview_tail = NULL;
+	native_overview_count = native_overview_bytes = 0;
+	native_overview_latest_ns = native_navigation_serial = 0;
+	native_overview_emitted = native_overview_unresolved = 0;
+	native_overview_ambiguous = native_overview_capacity_flushes = 0;
+	memset(native_packet_owners, 0, sizeof(native_packet_owners));
+}
+
 static void native_export_packet_event(const detail_event_t *detail,
 					trace_t *trace, int cpu)
 {
@@ -2070,12 +2393,14 @@ static void native_export_packet_event(const detail_event_t *detail,
 	char source[INET6_ADDRSTRLEN], dest[INET6_ADDRSTRLEN];
 	char flow_tag[16], id_hex[7], name[128];
 	u64 io_id, call_id, socket_id;
+	size_t annotation_offset, annotation_size;
 	const char *stage = trace_event_name(trace, event);
 	bool dropped = TRACE_HAS_ANALYZER(trace, drop);
 	bool terminal = packet_trace_terminal(trace);
 	bool flow_anchor = flow_packet_anchor(trace, pkt->proto_l4,
 					      detail->direction);
 
+	native_packet_overview_observe(detail);
 	thread = native_thread_track(event->tgid, event->tid, detail->task);
 	if (!thread)
 		return;
@@ -2088,6 +2413,7 @@ static void native_export_packet_event(const detail_event_t *detail,
 			   "anettrace.packet");
 	native_event_flow(&track_event, id, terminal);
 	native_event_correlation(&track_event, flow_id);
+	annotation_offset = track_event.size;
 	native_annotation_string(&track_event, "stage", stage);
 	native_annotation_id(&track_event, "packet_id", id);
 	native_annotation_string(&track_event, "packet_identity", event->key_generation ?
@@ -2096,7 +2422,6 @@ static void native_export_packet_event(const detail_event_t *detail,
 			     object_id("skb", event->key));
 	native_annotation_id(&track_event, "flow_id", flow_id);
 	native_annotation_string(&track_event, "flow_tag", flow_tag);
-	native_annotation_id(&track_event, "socket_id", socket_id);
 	native_annotation_id(&track_event, "io_id", io_id);
 	native_annotation_id(&track_event, "call_id", call_id);
 	if (detail->io_role == 4)
@@ -2106,6 +2431,7 @@ static void native_export_packet_event(const detail_event_t *detail,
 	native_annotation_bool(&track_event, "terminal", terminal);
 	native_annotation_bool(&track_event, "dropped", dropped);
 	native_annotation_bool(&track_event, "flow_anchor", flow_anchor);
+	native_annotation_bool(&track_event, "owner_valid", detail->owner_valid);
 	native_annotation_uint(&track_event, "cpu", cpu);
 	native_annotation_uint(&track_event, "uid", event->uid);
 	native_annotation_string(&track_event, "direction",
@@ -2128,9 +2454,18 @@ static void native_export_packet_event(const detail_event_t *detail,
 	native_annotation_uint(&track_event, "proto_l3", pkt->proto_l3);
 	native_annotation_uint(&track_event, "proto_l4", pkt->proto_l4);
 	native_annotation_string(&track_event, "saddr", source);
-	native_annotation_uint(&track_event, "sport", ntohs(pkt->l4.min.sport));
 	native_annotation_string(&track_event, "daddr", dest);
-	native_annotation_uint(&track_event, "dport", ntohs(pkt->l4.min.dport));
+	if (packet_is_icmp(pkt)) {
+		native_annotation_uint(&track_event, "icmp_type", pkt->l4.icmp.type);
+		native_annotation_uint(&track_event, "icmp_code", pkt->l4.icmp.code);
+		if (packet_is_icmp_echo(pkt)) {
+			native_annotation_uint(&track_event, "icmp_id", ntohs(pkt->l4.icmp.id));
+			native_annotation_uint(&track_event, "icmp_seq", ntohs(pkt->l4.icmp.seq));
+		}
+	} else {
+		native_annotation_uint(&track_event, "sport", ntohs(pkt->l4.min.sport));
+		native_annotation_uint(&track_event, "dport", ntohs(pkt->l4.min.dport));
+	}
 	native_annotation_uint(&track_event, "mark", pkt->mark);
 	if (pkt->proto_l3 == ETH_P_IP && pkt->ip_id_valid) {
 		native_annotation_uint(&track_event, "ip_id", pkt->l3.ipv4.id);
@@ -2156,7 +2491,10 @@ static void native_export_packet_event(const detail_event_t *detail,
 		native_annotation_id(&track_event, "drop_location_id",
 			object_id("drop_location", drop->location));
 	}
-	native_event_write(pkt->ts, &track_event);
+	annotation_size = track_event.size - annotation_offset;
+	native_annotation_id(&track_event, "socket_id", socket_id);
+	native_packet_overview_queue(detail, flow_id, thread->uuid, name,
+		&track_event, annotation_offset, annotation_size);
 	proto_free(&track_event);
 }
 
@@ -2255,6 +2593,7 @@ static void export_state_start(void)
 	last_clock_snapshot_ns = 0;
 	native_sequence_started = false;
 	native_failed = false;
+	native_packet_overview_reset();
 	free(native_tracks);
 	native_tracks = NULL;
 	native_track_count = 0;
@@ -2502,8 +2841,8 @@ static void export_packet_event(const detail_event_t *detail, trace_t *trace,
 		"\"owner_tid\":%u,\"owner_tgid\":%u,\"owner_uid\":%u,"
 		"\"owner_socket_id\":\"%016llx\","
 		"\"ifindex\":%u,\"netns\":%u,\"proto_l3\":%u,"
-		"\"proto_l4\":%u,\"saddr\":\"%s\",\"sport\":%u,"
-		"\"daddr\":\"%s\",\"dport\":%u,\"mark\":%u",
+		"\"proto_l4\":%u,\"saddr\":\"%s\","
+		"\"daddr\":\"%s\",\"mark\":%u",
 		PERFETTO_SCHEMA, pkt->ts, packet_id(pkt, event->key, event->key_generation),
 		object_id("skb", event->key), flow_id, flow_tag, socket_id, io_id, call_id, stage,
 		terminal ? "true" : "false",
@@ -2513,9 +2852,17 @@ static void export_packet_event(const detail_event_t *detail, trace_t *trace,
 		detail->owner_valid ? "true" : "false", detail->owner_tid,
 		detail->owner_tgid, detail->owner_uid, owner_socket_id,
 		detail->ifindex, detail->netns,
-		pkt->proto_l3, pkt->proto_l4, source,
-		ntohs(pkt->l4.min.sport), dest, ntohs(pkt->l4.min.dport),
-		pkt->mark);
+		pkt->proto_l3, pkt->proto_l4, source, dest, pkt->mark);
+	if (packet_is_icmp(pkt)) {
+		fprintf(export_file, ",\"icmp_type\":%u,\"icmp_code\":%u",
+			pkt->l4.icmp.type, pkt->l4.icmp.code);
+		if (packet_is_icmp_echo(pkt))
+			fprintf(export_file, ",\"icmp_id\":%u,\"icmp_seq\":%u",
+				ntohs(pkt->l4.icmp.id), ntohs(pkt->l4.icmp.seq));
+	} else {
+		fprintf(export_file, ",\"sport\":%u,\"dport\":%u",
+			ntohs(pkt->l4.min.sport), ntohs(pkt->l4.min.dport));
+	}
 	if (detail->io_role == 4)
 		fprintf(export_file, ",\"io_evidence\":\"stored_submission_context\"");
 	if (detail->io_multiple)
@@ -3058,6 +3405,7 @@ void perfetto_export_event(const void *data, int cpu, u32 size)
 		if (!trace_using_sk(trace)) {
 			pthread_mutex_lock(&export_lock);
 			write_clock_snapshot_if_due();
+			native_packet_overview_observe(detail);
 			struct flow_state *flow = flow_from_packet(detail, trace);
 			export_packet_io_link(detail, flow);
 			pthread_mutex_unlock(&export_lock);
@@ -3067,6 +3415,7 @@ void perfetto_export_event(const void *data, int cpu, u32 size)
 
 	pthread_mutex_lock(&export_lock);
 	write_clock_snapshot_if_due();
+	native_packet_overview_flush(event->pkt.ts, false);
 	if (trace_is_io(trace)) {
 		pending_io_start(detail, trace, cpu);
 	} else if (!strcmp(trace->name, "sk_alloc") &&
@@ -3153,6 +3502,7 @@ void perfetto_export_tick(void)
 	if (export_file || native_file)
 		write_clock_snapshot_if_due();
 	if (now) {
+		native_packet_overview_flush(now, false);
 		for (i = 0; i < flow_count; i++)
 			if (flows[i].active &&
 			    flows[i].protocol == IPPROTO_UDP &&
@@ -3175,6 +3525,7 @@ void perfetto_export_close(u64 event_count)
 		end_ts = timespec_to_ns(&monotonic);
 	pthread_mutex_lock(&export_lock);
 	write_clock_snapshot();
+	native_packet_overview_flush(end_ts, true);
 	{
 		size_t i;
 
@@ -3194,6 +3545,15 @@ void perfetto_export_close(u64 event_count)
 	}
 	if (native_file) {
 		size_t i;
+
+		native_export_meta(end_ts, "socket_packet_overview", -1,
+			native_overview_emitted, "mirrored_events",
+			native_overview_unresolved, "unresolved_events",
+			native_overview_ambiguous, "ambiguous_events");
+		native_export_meta(end_ts, "socket_packet_overview_buffer", -1,
+			native_overview_capacity_flushes, "capacity_flushes",
+			NATIVE_OVERVIEW_WINDOW_NS, "window_ns",
+			NATIVE_OVERVIEW_MAX_EVENTS, "max_events");
 
 		for (i = 0; i < native_track_count; i++)
 			if (native_tracks[i].kind == NATIVE_TRACK_SOCKET)
@@ -3249,6 +3609,7 @@ void perfetto_export_close(u64 event_count)
 	}
 	native_packet_queue_free(&native_persistent_packets);
 	native_packet_queue_free(&native_ring_packets);
+	native_packet_overview_reset();
 	native_ring_window_ns = 0;
 	native_ring_latest_ns = 0;
 	free(native_tracks);

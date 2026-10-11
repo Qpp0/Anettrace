@@ -158,7 +158,7 @@ require_text '"tx_write_end"' src/perfetto_export.c
 require_text '"anettrace.rx.read"' src/perfetto_export.c
 require_text '"anettrace.flow"' src/perfetto_export.c
 require_text '"byte_scope", "application_payload"' src/perfetto_export.c
-require_text 'native_socket_track(flow->socket_id, flow->owner_tgid' \
+require_text 'flow->owner_valid ? flow->owner_tgid : 0' \
 	src/perfetto_export.c
 require_text '"idle_timeout"' src/perfetto_export.c
 require_text 'flow->tx_bytes += bytes;' src/perfetto_export.c
@@ -170,7 +170,7 @@ require_text 'ipv6_is_v4_mapped' src/perfetto_export.c
 require_text 'pending_io_find_logical' src/perfetto_export.c
 require_text '!strcmp(trace->name, "ip_output")' src/perfetto_export.c
 require_text 'sock->proto_l3 != ETH_P_IP && sock->proto_l3 != ETH_P_IPV6' src/perfetto_export.c
-require_text 'if ((args->pid || args->uid_enabled) && !current_matches' \
+require_text 'if ((args->pid || args->uid_enabled) && (icmp || !current_matches)' \
 	src/progs/core.c
 require_text '\"skb_id\":' src/perfetto_export.c
 require_text 'native_annotation_uint(&track_event, "ip_id",' src/perfetto_export.c
@@ -250,7 +250,7 @@ require_text 'packet.timestamp_clock_id = CLOCK_MONOTONIC' \
 	tools/anettrace_to_perfetto.py
 require_text 'packet_record = self.chain_record(record)' \
 	tools/anettrace_to_perfetto.py
-require_text 'record.get("tgid", record.get("owner_tgid", 0))' \
+require_text 'self.process_track(*owner) if owner else 0' \
 	tools/anettrace_to_perfetto.py
 require_text '"byte_scope"' tools/anettrace_to_perfetto.py
 require_text 'track_event.correlation_id = correlation_id' \
@@ -331,6 +331,7 @@ if [[ "${ANETTRACE_STATIC_ONLY:-0}" != 1 ]]; then
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_network_syscalls.py'
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_flow_identity.py'
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_rx_capture.py'
+	python3 -m unittest discover -s "$ROOT/tests" -p 'test_icmp_capture.py'
 fi
 
 echo "source contracts: ok"

@@ -66,6 +66,8 @@ bool trace_event_visible(const trace_t *trace, const event_t *event)
 		"udpv6_sendmsg",
 		"udp_rcv",
 		"udpv6_rcv",
+		"icmp_rcv",
+		"icmpv6_rcv",
 		"udp_recvmsg",
 		"udpv6_recvmsg",
 		"connect_sys_enter",
@@ -89,7 +91,9 @@ bool trace_event_visible(const trace_t *trace, const event_t *event)
 	if (trace_name_matches(trace, "ip_output") ||
 	    trace_name_matches(trace, "ip6_output"))
 		return event->pkt.proto_l4 == IPPROTO_TCP ||
-		       event->pkt.proto_l4 == IPPROTO_UDP;
+		       event->pkt.proto_l4 == IPPROTO_UDP ||
+		       event->pkt.proto_l4 == IPPROTO_ICMP ||
+		       event->pkt.proto_l4 == IPPROTO_ICMPV6;
 	for (i = 0; i < sizeof(compact_events) / sizeof(compact_events[0]); i++)
 		if (trace_name_matches(trace, compact_events[i]))
 			return true;
@@ -148,6 +152,12 @@ const char *trace_event_name(const trace_t *trace, const event_t *event)
 	packet = &event->pkt;
 	ip_output = trace_name_matches(trace, "ip_output") ||
 		    trace_name_matches(trace, "ip6_output");
+	if (packet->proto_l4 == IPPROTO_ICMP &&
+	    (ip_output || trace_name_matches(trace, "icmp_rcv")))
+		return ip_output ? "ICMP packet send" : "ICMP packet receive";
+	if (packet->proto_l4 == IPPROTO_ICMPV6 &&
+	    (ip_output || trace_name_matches(trace, "icmpv6_rcv")))
+		return ip_output ? "ICMPv6 packet send" : "ICMPv6 packet receive";
 	tx = trace_name_matches(trace, "__tcp_transmit_skb") ||
 	     (ip_output && packet->proto_l4 == IPPROTO_TCP);
 	if (tx || trace_name_matches(trace, "tcp_v4_rcv") ||
@@ -597,6 +607,10 @@ static void trace_prepare_pesudo(trace_args_t *args, bpf_args_t *bpf_args)
 		&trace___udp_enqueue_schedule_skb, &trace_udp_recvmsg,
 		&trace_udpv6_recvmsg, &trace_skb_consume_udp,
 		&trace_skb_copy_datagram_iter, &trace_skb_copy_and_csum_datagram_msg,
+		&trace_icmp_rcv, &trace_icmp_echo, &trace_icmp_reply,
+		&trace_icmpv6_rcv, &trace_icmpv6_echo_reply, &trace_ping_rcv,
+		&trace___ping_queue_rcv_skb, &trace_ping_queue_rcv_skb,
+		&trace_ping_lookup,
 	};
 	static trace_t *perfetto_tx_traces[] = {
 		&trace_tcp_sendmsg, &trace_tcp_sendmsg_locked,
@@ -620,10 +634,10 @@ static void trace_prepare_pesudo(trace_args_t *args, bpf_args_t *bpf_args)
 		"consume_skb,kfree_skb,__kfree_skb,kfree_skb_partial,skb_attempt_defer_free,"
 		"__tcp_transmit_skb,udp_sendmsg,udpv6_sendmsg,"
 		"ip_output,ip6_output,tcp_v4_rcv,tcp_v6_rcv,"
-		"udp_rcv,udpv6_rcv,udp_recvmsg,udpv6_recvmsg";
+		"udp_rcv,udpv6_rcv,udp_recvmsg,udpv6_recvmsg,icmp_rcv,icmpv6_rcv";
 	/* Detailed capture follows the complete registered catalogue, including
 	 * optional kernel paths. Availability and explicit exclusions still apply.
-	 * Protocol parsing and export remain scoped to supported TCP/UDP events. */
+	 * Protocol parsing and export remain scoped to TCP/UDP and ICMP events. */
 	static char perfetto_detailed_traces[] = "all";
 	static char connect_diagnostic_traces[] =
 		"connect_sys_enter,connect_sys_exit,inet_stream_connect,"
@@ -700,6 +714,10 @@ static void trace_enable_perfetto_output()
 	if (trace_is_enable(&trace_udp_send_skb))
 		trace_set_enable(&trace_ip_output);
 	if (trace_is_enable(&trace_udp_v6_send_skb))
+		trace_set_enable(&trace_ip6_output);
+	if (trace_is_enable(&trace_icmp_rcv))
+		trace_set_enable(&trace_ip_output);
+	if (trace_is_enable(&trace_icmpv6_rcv))
 		trace_set_enable(&trace_ip6_output);
 	/* Socket ownership first becomes observable below the transport entry.
 	 * Keep these correlation probes even when compact output hides their

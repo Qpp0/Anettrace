@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import sys
 from pathlib import Path
@@ -43,9 +44,23 @@ def nonzero_id(value: Any) -> int | None:
     return id_value(str(value)) or None
 
 
+def network_endpoint(record: dict[str, Any], address_key: str,
+                     port_key: str) -> tuple[str, int] | None:
+    if not record.get(address_key) or record.get(port_key) is None:
+        return None
+    address = ipaddress.ip_address(str(record[address_key]))
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return str(address), int(record[port_key])
+
+
 def flow_prefix(record: dict[str, Any]) -> str:
     protocol = str(record.get("protocol", "")).lower()
     proto_l4 = int(record.get("proto_l4", 0) or 0)
+    if proto_l4 == 1 or protocol == "icmp":
+        return "icmp"
+    if proto_l4 == 58 or protocol == "icmpv6":
+        return "icmpv6"
     ports = {
         int(record.get(key, 0) or 0)
         for key in ("sport", "dport", "local_port", "remote_port")
@@ -106,7 +121,8 @@ class PerfettoExporter:
         self.closed_sockets: set[str] = set()
         self.flow_tracks: dict[str, int] = {}
         self.flow_labels: dict[str, str] = {}
-        self.flow_label_counts = {"tcp": 0, "udp": 0, "dns": 0, "flow": 0}
+        self.flow_label_counts = {"tcp": 0, "udp": 0, "dns": 0,
+                                  "icmp": 0, "icmpv6": 0, "flow": 0}
         self.active_flows: set[str] = set()
         self.pending_io: dict[tuple[str, str, int], int] = {}
         self.connect_tracks: dict[str, int] = {}
@@ -116,6 +132,86 @@ class PerfettoExporter:
         self.capture_start_monotonic_ns = 0
         self.clock_monotonic_ns: list[int] = []
         self.sequence_started = False
+        self.packet_navigation_serial = 0
+        self.flow_sockets: dict[int, set[int]] = {}
+        self.packet_sockets: dict[tuple[int, str], set[int]] = {}
+        self.packet_flows: dict[tuple[int, str], set[int]] = {}
+        self.flow_endpoints: dict[int, set[tuple[str, int]]] = {}
+        self.socket_owners: dict[int, tuple[int, str]] = {}
+        self.index_socket_evidence()
+
+    def index_socket_evidence(self) -> None:
+        owner_candidates: dict[int, list[tuple[int, int, str]]] = {}
+        for record in self.records:
+            socket = nonzero_id(record.get("socket_id")) or nonzero_id(record.get("owner_socket_id"))
+            flow = nonzero_id(record.get("flow_id"))
+            packet = nonzero_id(record.get("packet_id"))
+            direction = str(record.get("direction", "unknown"))
+            packet_key = (packet, direction if direction in ("tx", "rx") else "unknown")
+            if packet and flow:
+                self.packet_flows.setdefault(packet_key, set()).add(flow)
+            if flow and record.get("type") in ("flow_start", "flow_end"):
+                endpoint = network_endpoint(record, "local_addr", "local_port")
+                if endpoint:
+                    self.flow_endpoints.setdefault(flow, set()).add(endpoint)
+            if not socket:
+                continue
+            if flow:
+                self.flow_sockets.setdefault(flow, set()).add(socket)
+            if packet:
+                self.packet_sockets.setdefault(packet_key, set()).add(socket)
+            # Creation identifies the owning process even if a receive packet
+            # first appears on a softirq thread. Other records need explicit
+            # owner evidence; their current task alone is not ownership.
+            tgid = int(record.get("owner_tgid", 0) or 0)
+            priority = 1
+            if record.get("type") == "socket_create":
+                tgid = int(record.get("tgid", 0) or 0)
+                priority = 2
+            elif record.get("owner_valid") is False:
+                tgid = 0
+            if tgid:
+                task = str(record.get("task", "")) if (
+                    priority == 2 or tgid == int(record.get("tgid", 0) or 0)
+                ) else ""
+                owner_candidates.setdefault(socket, []).append((priority, tgid, task))
+        for socket, candidates in owner_candidates.items():
+            priority = max(item[0] for item in candidates)
+            owners = {item[1] for item in candidates if item[0] == priority}
+            if len(owners) == 1:
+                tgid = owners.pop()
+                task = next((item[2] for item in candidates
+                             if item[0] == priority and item[2]), "")
+                self.socket_owners[socket] = (tgid, task)
+
+    def packet_socket_id(self, record: dict[str, Any]) -> int | None:
+        direct = nonzero_id(record.get("socket_id")) or nonzero_id(record.get("owner_socket_id"))
+        if direct:
+            return direct
+        packet = nonzero_id(record.get("packet_id"))
+        direction = str(record.get("direction", "unknown"))
+        packet_key = (packet, direction if direction in ("tx", "rx") else "unknown")
+        sockets = self.packet_sockets.get(packet_key, set())
+        if sockets:
+            return next(iter(sockets)) if len(sockets) == 1 else None
+        flows = self.packet_flows.get(packet_key, set()).copy()
+        flow = nonzero_id(record.get("flow_id"))
+        if flow:
+            flows.add(flow)
+        sockets = set()
+        for flow in flows:
+            endpoints = self.flow_endpoints.get(flow, set())
+            if endpoints:
+                # A bidirectional tuple can match the sending socket while a
+                # loopback skb is arriving at a different local socket.
+                if direction not in ("tx", "rx") or len(endpoints) != 1:
+                    continue
+                endpoint = network_endpoint(record, "saddr", "sport") if direction == "tx" else (
+                    network_endpoint(record, "daddr", "dport"))
+                if endpoint and endpoint not in endpoints:
+                    continue
+            sockets.update(self.flow_sockets.get(flow, ()))
+        return next(iter(sockets)) if len(sockets) == 1 else None
 
     def sequence_packet(self):
         packet = self.builder.add_packet()
@@ -188,11 +284,22 @@ class PerfettoExporter:
         uuid = self.socket_tracks.get(socket_id)
         if uuid is not None:
             return uuid
-        tgid = int(record.get("tgid", record.get("owner_tgid", 0)))
-        parent_uuid = self.process_track(tgid, str(record.get("task", "")))
-        uuid = stable_uuid("socket", socket_id)
+        socket = id_value(socket_id)
+        owner = self.socket_owners.get(socket)
+        parent_uuid = self.process_track(*owner) if owner else 0
+        uuid = stable_uuid("socket", socket)
         self.descriptor(uuid, f"socket {socket_id[-8:]}", parent_uuid)
         self.socket_tracks[socket_id] = uuid
+        return uuid
+
+    def socket_packet_track(self, socket: int, record: dict[str, Any]) -> int:
+        direction = str(record.get("direction", "unknown"))
+        if direction not in ("tx", "rx"):
+            direction = "unknown"
+        parent = self.socket_track(f"{socket:016x}", record)
+        uuid = stable_uuid("socket-packets", socket, direction)
+        name = {"tx": "TX packets", "rx": "RX packets"}.get(direction, "Unknown direction packets")
+        self.descriptor(uuid, name, parent)
         return uuid
 
     def flow_track(self, flow_id: str, record: dict[str, Any]) -> int:
@@ -488,10 +595,66 @@ class PerfettoExporter:
         packet_id = str(record["packet_id"])
         flow_id = str(record.get("flow_id", "0"))
         packet_record = self.chain_record(record)
-        tag = packet_record.get("flow_tag", flow_prefix(record))
+        tag = packet_record.get("flow_tag") or flow_prefix(record)
+        protocol = int(record.get("proto_l4", 0) or 0)
+        protocol_fields = ("sport", "dport")
+        if protocol in (1, 58):
+            protocol_fields = ("icmp_type", "icmp_code")
+            echo_types = (0, 8) if protocol == 1 else (128, 129)
+            if int(record.get("icmp_type", -1)) in echo_types:
+                protocol_fields += ("icmp_id", "icmp_seq")
+        source_track = self.thread_track(record)
+        socket = self.packet_socket_id(record)
+        navigation_id = None
+        if socket:
+            self.packet_navigation_serial += 1
+            navigation_id = stable_uuid("socket-packet-navigation", self.packet_navigation_serial)
+            packet_record["navigation_id"] = f"{navigation_id:016x}"
+        packet_fields = (
+            "stage",
+            "packet_id",
+            "skb_id",
+            "flow_id",
+            "flow_tag",
+            "socket_id",
+            "io_id",
+            "call_id",
+            "io_evidence",
+            "submission_association",
+            "terminal",
+            "dropped",
+            "flow_anchor",
+            "cpu",
+            "uid",
+            "direction",
+            "owner_valid",
+            "owner_tid",
+            "owner_tgid",
+            "owner_uid",
+            "owner_socket_id",
+            "ifname",
+            "ifindex",
+            "netns",
+            "proto_l3",
+            "proto_l4",
+            "saddr",
+            "daddr",
+            *protocol_fields,
+            "mark",
+            "ip_id",
+            "ip_id_hex",
+            "dns_transaction_id",
+            "dns_transaction_id_hex",
+            "tcp_seq",
+            "tcp_ack",
+            "tcp_flags",
+            "drop_reason",
+            "drop_location_id",
+            "navigation_id",
+        )
         self.event(
             int(record["ts_ns"]),
-            self.thread_track(record),
+            source_track,
             TrackEvent.TYPE_INSTANT,
             f"{tag} · {record['stage']}",
             "anettrace.packet.drop"
@@ -499,55 +662,28 @@ class PerfettoExporter:
             else "anettrace.packet",
             id_value(packet_id),
             bool(record.get("terminal")),
-            # A connection identifies related packets, not a causal sequence
-            # between different packets. Only the packet ID creates this edge.
+            # A connection groups related packets. Packet IDs keep the causal
+            # chain; the separate navigation ID terminates at this one mirror.
             correlation_id=id_value(flow_id),
+            linked_flow_ids=(navigation_id,) if navigation_id else (),
             annotations=(
                 packet_record,
-                (
-                    "stage",
-                    "packet_id",
-                    "skb_id",
-                    "flow_id",
-                    "flow_tag",
-                    "socket_id",
-                    "io_id",
-                    "call_id",
-                    "io_evidence",
-                    "submission_association",
-                    "terminal",
-                    "dropped",
-                    "flow_anchor",
-                    "cpu",
-                    "uid",
-                    "direction",
-                    "owner_valid",
-                    "owner_tid",
-                    "owner_tgid",
-                    "owner_uid",
-                    "owner_socket_id",
-                    "ifname",
-                    "ifindex",
-                    "netns",
-                    "proto_l3",
-                    "proto_l4",
-                    "saddr",
-                    "sport",
-                    "daddr",
-                    "dport",
-                    "mark",
-                    "ip_id",
-                    "ip_id_hex",
-                    "dns_transaction_id",
-                    "dns_transaction_id_hex",
-                    "tcp_seq",
-                    "tcp_ack",
-                    "tcp_flags",
-                    "drop_reason",
-                    "drop_location_id",
-                ),
+                packet_fields,
             ),
         )
+
+        if socket:
+            overview = dict(packet_record, socket_id=f"{socket:016x}",
+                            source_tid=int(record.get("tid", 0)),
+                            source_tgid=int(record.get("tgid", 0)),
+                            source_ts_ns=int(record["ts_ns"]), source_track_uuid=f"{source_track:016x}")
+            self.event(
+                int(record["ts_ns"]), self.socket_packet_track(socket, record),
+                TrackEvent.TYPE_INSTANT, f"{tag} · {record['stage']}",
+                "anettrace.socket.packet", flow_id=navigation_id, terminating_flow=True,
+                annotations=(overview, packet_fields + ("source_tid", "source_tgid",
+                                                        "source_ts_ns", "source_track_uuid")),
+            )
 
     def export_packet_io_link(self, record: dict[str, Any]) -> None:
         record = self.chain_record(record)

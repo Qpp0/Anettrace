@@ -128,6 +128,8 @@ jobs:
 
       - name: Verify TCP and UDP send markers with protocol trace groups
         run: sudo python3 tests/send_packet_integration.py ./src/anettrace
+      - name: Verify ICMP and ICMPv6 packet send and receive events
+        run: sudo python3 tests/icmp_trace_integration.py ./src/anettrace
       - name: Run timezone offset tests
         run: |
           gcc -O2 -Wall -Wextra -Iutils \
@@ -166,5 +168,6 @@ jobs:
           /tmp/perfetto-venv/bin/python -m unittest \
             tests/test_perfetto_converter.py \
             tests/test_perfetto_graph.py \
+            tests/test_socket_overview_native.py \
             tests/test_trace_merge.py \
             tests/test_connect_diagnostics_schema.py
