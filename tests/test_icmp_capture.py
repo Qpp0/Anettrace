@@ -59,7 +59,11 @@ static void bpf_map_update_elem(void *map, const void *key, const void *value, i
 static void perfetto_flow_key(packet_t *pkt, perfetto_flow_key_t *key, u32 netns) {
     keys++;
 }
-''' + function(source, "perfetto_lookup_flow") + function(source, "perfetto_store_flow")
+''' + function(source, "perfetto_lookup_flow")
+        # The native harness also runs with GCC; this Clang-only BPF unroll
+        # hint does not affect the helper's behavior under test.
+        code += function(source, "perfetto_store_flow").replace(
+            "#pragma clang loop unroll(full)\n", "")
         result = self.run_source(code, r'''
 perfetto_owner_t owner = {.socket_key=1};
 perfetto_flow_key_t key = {0};
