@@ -162,7 +162,6 @@ def worker_thread_identity(binary):
                     assert run.wait(10)
                     client.sendto(b"worker", server.getsockname())
                     assert client.recv(8192) == payload
-                    observed["local"] = client.getsockname()
             except Exception as error:
                 errors.append(error)
                 ready.set()
@@ -179,7 +178,8 @@ def worker_thread_identity(binary):
             server.sendto(payload, peer)
             worker.join(timeout=5)
             assert not worker.is_alive() and not errors, errors
-            local = f"{observed['local'][0]}:{observed['local'][1]}"
+            # Unconnected UDP getsockname may still report the wildcard address.
+            local = f"{peer[0]}:{peer[1]}"
             remote = f"127.0.0.1:{server.getsockname()[1]}"
             terminal.until(lambda: f"TID {observed['tid']} net-rx-worker" in terminal.frame
                            and f"PID {os.getpid()}" in terminal.frame
