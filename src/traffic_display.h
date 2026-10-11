@@ -11,6 +11,7 @@
 struct traffic_display_row {
 	uint32_t pid, tid, flow_count;
 	char comm[17], protocol[8], local[64], remote[64];
+	char last_seen[20];
 	uint64_t rx_bytes, tx_bytes;
 	double rx_rate, tx_rate, idle_seconds;
 };
@@ -21,6 +22,7 @@ struct traffic_display_snapshot {
 	uint64_t rx_bytes, tx_bytes;
 	double rx_rate, tx_rate, elapsed_seconds;
 	unsigned int interval_seconds;
+	char timestamp[20];
 	const char *protocol, *filter, *warning;
 	bool flows;
 };

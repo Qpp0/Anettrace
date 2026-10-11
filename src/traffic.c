@@ -33,7 +33,6 @@ struct traffic_process_row {
 };
 
 #define TRAFFIC_MAX_LINKS 15
-#define TRAFFIC_RECENT_NS (10ULL * 1000000000ULL)
 
 struct traffic_session {
 	trace_args_t *args;
@@ -383,6 +382,17 @@ static void traffic_render_cached(struct traffic_session *session)
 	traffic_display_render(&session->display, &session->snapshot);
 }
 
+static void traffic_format_timestamp(char text[20], u64 now_ns)
+{
+	char timestamp[64];
+
+	ts_print_ts(timestamp, now_ns, TIME_MODE_DATE);
+	if (strlen(timestamp) >= 21 && timestamp[0] == '[' && timestamp[5] == '-')
+		snprintf(text, 20, "%.19s", timestamp + 1);
+	else
+		snprintf(text, 20, "未知");
+}
+
 static void traffic_display_counters(struct traffic_display_row *row,
 		const traffic_flow_value_t *value, const traffic_flow_value_t *previous,
 		u64 since_ns, u64 now_ns, bool *incomplete)
@@ -396,6 +406,7 @@ static void traffic_display_counters(struct traffic_display_row *row,
 	row->tx_rate = traffic_bytes_per_second(tx, now_ns - since_ns);
 	row->idle_seconds = now_ns > value->last_seen_ns ?
 		(now_ns - value->last_seen_ns) / 1000000000.0 : 0;
+	traffic_format_timestamp(row->last_seen, value->last_seen_ns);
 }
 
 static void traffic_sample_warning(struct traffic_session *session,
@@ -443,6 +454,7 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 	int flow_count, process_count, i;
 
 	/* Sample the header before map walks so its elapsed interval stays accurate. */
+	traffic_format_timestamp(session->snapshot.timestamp, now_ns);
 	session->snapshot.rx_rate = session->snapshot.tx_rate = 0;
 	if (bpf_map_lookup_elem(bpf_map__fd(session->skel->maps.traffic_totals),
 				&index, &totals)) {
@@ -480,9 +492,7 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 		}, *process;
 		struct traffic_display_row *row;
 
-		if (!current->value.last_seen_ns ||
-		    (now_ns > current->value.last_seen_ns &&
-		     now_ns - current->value.last_seen_ns > TRAFFIC_RECENT_NS))
+		if (!current->value.last_seen_ns)
 			continue;
 		process = bsearch(&process_key, session->process_rows, process_count,
 			sizeof(*process), traffic_process_key_compare);
@@ -508,8 +518,7 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 		traffic_flow_value_t *value = &current->value.counters;
 		struct traffic_display_row *row;
 
-		if (!value->last_seen_ns || (now_ns > value->last_seen_ns &&
-		    now_ns - value->last_seen_ns > TRAFFIC_RECENT_NS))
+		if (!value->last_seen_ns)
 			continue;
 		previous = bsearch(current, session->previous_process_rows,
 			session->previous_process_count, sizeof(*previous), traffic_process_key_compare);
@@ -528,7 +537,7 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 		sizeof(*session->process_display_rows), traffic_display_row_compare);
 	session->snapshot.elapsed_seconds = (now_ns - session->start_ns) / 1000000000.0;
 	traffic_sample_warning(session, read_error, sample_gap);
-	/* Retain every observed entry as a baseline, including hidden idle rows. */
+	/* Retain every observed entry as a baseline, including idle rows. */
 	flow_swap = session->previous_rows;
 	session->previous_rows = session->rows;
 	session->rows = flow_swap;
@@ -832,6 +841,7 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 	session->snapshot.filter = session->filter;
 	session->snapshot.warning = session->warning;
 	session->snapshot.interval_seconds = args->traffic_interval;
+	traffic_format_timestamp(session->snapshot.timestamp, traffic_monotonic_ns());
 	session->snapshot.flows = true;
 	if (traffic_display_open(&session->display))
 		traffic_render_cached(session);

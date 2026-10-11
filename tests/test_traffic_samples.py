@@ -152,7 +152,10 @@ static int bpf_map_lookup_elem(int fd,const void *key,void *value) {
 typedef struct { int unused; } trace_args_t;
 struct traffic { struct { int traffic_flows,traffic_processes,traffic_totals,traffic_stats; } maps; };
 #define TRAFFIC_MAX_LINKS 15
-#define TRAFFIC_RECENT_NS (10ULL * 1000000000ULL)
+#define TIME_MODE_DATE 1
+static int ts_print_ts(char *text, u64 now, int mode) {
+    (void)now; (void)mode; return sprintf(text, "[2026-10-12 00:05:07.000000] ");
+}
 static u64 total_rx;
 static bool fail_totals;
 static int bpf_map__fd(int map) { return map; }
@@ -177,7 +180,7 @@ void traffic_display_render(struct traffic_display *display,
                          "traffic_sample_deltas", "traffic_display_row_compare",
                          "traffic_collect_flow_sample", "traffic_collect_process_sample",
                          "traffic_protocol_name", "traffic_format_endpoint",
-                         "traffic_render_cached", "traffic_display_counters",
+                         "traffic_render_cached", "traffic_format_timestamp", "traffic_display_counters",
                          "traffic_sample_warning", "traffic_sample_display"), r'''
 struct traffic skel={.maps={1,2,3,4}};
 struct traffic_session session={.skel=&skel,.start_ns=100,.last_report_ns=100,

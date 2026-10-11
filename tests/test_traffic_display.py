@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
         .tx_bytes = 64000, .rx_rate = 16 * 1024 * 1024, .tx_rate = 1280,
         .elapsed_seconds = 92, .interval_seconds = 1,
         .protocol = "TCP/UDP", .filter = "UID 0",
+        .timestamp = "2026-10-12 00:05:07",
     };
     assert(argc == 2);
     if (!strcmp(argv[1], "math")) {
@@ -57,13 +58,19 @@ int main(int argc, char **argv) {
         rows[i].rx_rate = snapshot.rx_rate;
         rows[i].tx_rate = snapshot.tx_rate;
         rows[i].idle_seconds = i ? 4 : 0;
+        strcpy(rows[i].last_seen, "2026-10-11 23:59:59");
     }
-    if (!strcmp(argv[1], "threads") || !strcmp(argv[1], "chinese")) {
+    if (!strcmp(argv[1], "threads") || !strcmp(argv[1], "chinese") || !strcmp(argv[1], "idle")) {
         snapshot.flows = true;
         snapshot.row_count = 2;
         rows[0] = rows[1];
         rows[0].pid = rows[1].pid = 1234;
         rows[0].tid = 5678; rows[1].tid = 5679;
+    }
+    if (!strcmp(argv[1], "idle")) {
+        snapshot.row_count = 1;
+        rows[0].rx_rate = rows[0].tx_rate = 0;
+        rows[0].idle_seconds = 308;
     }
     if (!strcmp(argv[1], "chinese")) {
         snapshot.row_count = 1;
@@ -220,7 +227,7 @@ class TrafficDisplayTests(unittest.TestCase):
         visible = self.assert_frame_fits(output, 44, 45)
         self.assertIn(b"16.0 MiB/s", visible)
         self.assertIn(b"5.00 GiB", visible)
-        self.assertIn(b"recent flows", visible)
+        self.assertIn("活跃".encode(), visible)
         self.assertIn("未显示".encode(), visible)
         self.assertNotIn(b"\a", visible)
         os.write(master, b"f")
@@ -315,6 +322,22 @@ class TrafficDisplayTests(unittest.TestCase):
                 self.assertNotIn(b"TX retained", visible)
                 self.assertIn(b"16.0 MiB/s", visible)
                 self.assertIn(b"5.00 GiB", visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
+
+    def test_sample_time_and_idle_thread_last_io_stay_visible(self):
+        for columns in (32, 44, 110):
+            with self.subTest(columns=columns):
+                process, master, slave, original = self.start_terminal(
+                    columns=columns, mode="idle")
+                self.message(process, b"READY\n")
+                visible = self.assert_frame_fits(self.drain(master), columns, 45).decode()
+                for text in ("时间 2026-10-12 00:05:07", "最近 2026-10-11 23:59:59",
+                             "空闲 308s", "5678", "download-worker", "5.00 GiB"):
+                    self.assertIn(text, visible)
+                self.assertIn("0 B/s", visible)
                 os.write(master, b"q")
                 self.message(process, b"KEY q\n")
                 process.wait(timeout=3)

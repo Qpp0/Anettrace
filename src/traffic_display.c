@@ -206,7 +206,7 @@ static unsigned int traffic_row_lines(const struct traffic_display_row *row,
 	}
 	if (!wide && width < 40)
 		lines += 2;
-	return lines + spacing;
+	return lines + spacing + 1;
 }
 
 static void traffic_render_row(struct traffic_frame *frame,
@@ -219,10 +219,10 @@ static void traffic_render_row(struct traffic_frame *frame,
 	traffic_format_bytes(row->tx_rate, true, tx, sizeof(tx));
 	traffic_format_bytes((double)row->rx_bytes, false, rx_total, sizeof(rx_total));
 	traffic_format_bytes((double)row->tx_bytes, false, tx_total, sizeof(tx_total));
-	if (row->idle_seconds >= 1)
-		snprintf(status, sizeof(status), "idle %.0fs", row->idle_seconds);
+	if (!row->rx_rate && !row->tx_rate)
+		snprintf(status, sizeof(status), "空闲 %.0fs", row->idle_seconds);
 	else
-		snprintf(status, sizeof(status), "%u recent flows", row->flow_count);
+		snprintf(status, sizeof(status), "活跃");
 	if (wide) {
 		if (flows) {
 			traffic_line(frame, NULL, "%-7u %-*.16s %-7u %-3.3s %12s %12s %11s %11s",
@@ -239,8 +239,8 @@ static void traffic_render_row(struct traffic_frame *frame,
 	} else {
 		if (flows) {
 			traffic_line(frame, NULL, "TID %u %.16s", row->tid, row->comm);
-			traffic_line(frame, COLOR_MUTED, "PID %u %.7s%s", row->pid,
-				     row->protocol, row->idle_seconds >= 1 ? " | idle" : "");
+			traffic_line(frame, COLOR_MUTED, "PID %u %.7s | %s", row->pid,
+				     row->protocol, status);
 		} else {
 			traffic_line(frame, NULL, "%u %.16s | %s", row->pid, row->comm, status);
 		}
@@ -258,6 +258,8 @@ static void traffic_render_row(struct traffic_frame *frame,
 			traffic_line(frame, COLOR_TX, "TX %-12s | 累计发送 %s", tx, tx_total);
 		}
 	}
+	traffic_line(frame, COLOR_MUTED, "最近 %s%s%s", row->last_seen,
+		     wide && flows ? " | " : "", wide && flows ? status : "");
 	if (spacing)
 		traffic_line(frame, NULL, "");
 }
@@ -305,7 +307,7 @@ void traffic_display_render(struct traffic_display *display,
 		     snapshot->protocol ? snapshot->protocol : "TCP/UDP", snapshot->elapsed_seconds);
 	traffic_line(&frame, COLOR_MUTED, "%s | every %us",
 		     snapshot->filter ? snapshot->filter : "All processes", snapshot->interval_seconds);
-	traffic_line(&frame, NULL, "");
+	traffic_line(&frame, COLOR_MUTED, "时间 %s", snapshot->timestamp);
 	traffic_format_bytes(snapshot->rx_rate, true, rx, sizeof(rx));
 	traffic_format_bytes(snapshot->tx_rate, true, tx, sizeof(tx));
 	traffic_format_bytes((double)snapshot->rx_bytes, false, rx_total, sizeof(rx_total));
