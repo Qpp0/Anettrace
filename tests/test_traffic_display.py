@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import termios
 import time
+import unicodedata
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,12 +58,16 @@ int main(int argc, char **argv) {
         rows[i].tx_rate = snapshot.tx_rate;
         rows[i].idle_seconds = i ? 4 : 0;
     }
-    if (!strcmp(argv[1], "threads")) {
+    if (!strcmp(argv[1], "threads") || !strcmp(argv[1], "chinese")) {
         snapshot.flows = true;
         snapshot.row_count = 2;
         rows[0] = rows[1];
         rows[0].pid = rows[1].pid = 1234;
         rows[0].tid = 5678; rows[1].tid = 5679;
+    }
+    if (!strcmp(argv[1], "chinese")) {
+        snapshot.row_count = 1;
+        strcpy(rows[0].comm, "接收线程一");
     }
     if (!strcmp(argv[1], "empty")) {
         snapshot.row_count = 0;
@@ -197,7 +202,9 @@ class TrafficDisplayTests(unittest.TestCase):
         visible = ANSI.sub(b"", output).replace(b"\r", b"")
         lines = visible.split(b"\n")
         self.assertLessEqual(len(lines) - 1, rows - 1)
-        self.assertTrue(all(len(line) <= columns - 1 for line in lines), visible)
+        widths = [sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                      for c in line.decode("utf-8")) for line in lines]
+        self.assertTrue(all(width <= columns - 1 for width in widths), visible)
         self.assertNotIn(b"\x1b", visible)
         return visible
 
@@ -227,7 +234,7 @@ class TrafficDisplayTests(unittest.TestCase):
         self.message(process, b"KEY p\n")
         visible = self.assert_frame_fits(self.drain(master), 100, 16)
         self.assertIn(b"PROCESS VIEW", visible)
-        self.assertIn(b"RX/s", visible)
+        self.assertIn("接收速率".encode(), visible)
         os.write(master, b"q")
         self.message(process, b"KEY q\n")
         process.wait(timeout=3)
@@ -295,12 +302,49 @@ class TrafficDisplayTests(unittest.TestCase):
         process.wait(timeout=3)
         self.assert_restored(slave, original)
 
+    def test_rate_and_total_labels_are_distinct_and_chinese_fits_terminal(self):
+        for columns in (32, 44, 110):
+            with self.subTest(columns=columns):
+                process, master, slave, original = self.start_terminal(
+                    columns=columns, mode="threads")
+                self.message(process, b"READY\n")
+                visible = self.assert_frame_fits(self.drain(master), columns, 45)
+                for label in ("当前速率", "本次累计", "累计接收", "累计发送"):
+                    self.assertIn(label.encode(), visible)
+                self.assertNotIn(b"RX retained", visible)
+                self.assertNotIn(b"TX retained", visible)
+                self.assertIn(b"16.0 MiB/s", visible)
+                self.assertIn(b"5.00 GiB", visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
+
+    def test_chinese_thread_name_keeps_wide_counter_columns_aligned(self):
+        process, master, slave, original = self.start_terminal(columns=110, mode="chinese")
+        self.message(process, b"READY\n")
+        visible = self.assert_frame_fits(self.drain(master), 110, 45).decode()
+        self.assertIn("接收线程一", visible)
+        lines = visible.splitlines()
+        header = next(line for line in lines if "TID" in line and "THREAD" in line)
+        data = next(line for line in lines if "接收线程一" in line)
+        def end_column(line, text):
+            prefix = line[:line.index(text) + len(text)]
+            return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                       for c in prefix)
+        self.assertEqual(end_column(header, "累计接收"), end_column(data, "5.00 GiB"))
+        self.assertEqual(end_column(header, "累计发送"), end_column(data, "62.5 KiB"))
+        os.write(master, b"q")
+        self.message(process, b"KEY q\n")
+        process.wait(timeout=3)
+        self.assert_restored(slave, original)
+
     def test_empty_interval_and_long_warning_keep_session_totals_visible(self):
         process, master, slave, original = self.start_terminal(mode="empty", rows=20)
         self.message(process, b"READY\n")
         visible = self.assert_frame_fits(self.drain(master), 44, 20)
-        self.assertIn(b"RX now      0 B/s", visible)
-        self.assertIn(b"RX session  5.00 GiB", visible)
+        self.assertIn(b"RX  0 B/s", visible)
+        self.assertIn("累计接收  5.00 GiB".encode(), visible)
         self.assertIn(b"Waiting for socket traffic", visible)
         self.assertIn(b"Partial totals", visible)
         self.assertIn(b"...", visible)

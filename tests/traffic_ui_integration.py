@@ -123,17 +123,17 @@ def socket_counters_and_controls(binary):
             worker.join(timeout=5)
             assert not worker.is_alive() and not errors, errors
             # --pid selects the main TID: the reply thread is deliberately excluded.
-            terminal.until(lambda: re.search(r"RX session\s+1\.00 MiB", terminal.frame))
+            terminal.until(lambda: re.search(r"累计接收\s+1\.00 MiB", terminal.frame))
             terminal.until(lambda: f"TID {os.getpid()} traffic-main" in terminal.frame
                            and f"127.0.0.1:{server.getsockname()[1]}" in terminal.frame)
-            terminal.until(lambda: re.search(r"RX now\s+0 B/s", terminal.frame)
-                           and re.search(r"RX session\s+1\.00 MiB", terminal.frame))
+            terminal.until(lambda: re.search(r"RX\s+0 B/s", terminal.frame)
+                           and re.search(r"累计接收\s+1\.00 MiB", terminal.frame))
             terminal.key("f")
             remote = f"127.0.0.1:{server.getsockname()[1]}"
             terminal.until(lambda: "THREAD VIEW" in terminal.frame and remote in terminal.frame)
             terminal.key("p")
             terminal.until(lambda: "PROCESS VIEW" in terminal.frame
-                           and re.search(r"TX session\s+64 B", terminal.frame))
+                           and re.search(r"累计发送\s+64 B", terminal.frame))
         terminal.key("q")
         terminal.finish()
         summary = terminal.text.rsplit("Traffic session complete", 1)[-1]
@@ -185,8 +185,8 @@ def worker_thread_identity(binary):
                            and f"PID {os.getpid()}" in terminal.frame
                            and local in terminal.frame and remote in terminal.frame)
             assert observed["tid"] != os.getpid()
-            assert re.search(r"RX session\s+4\.00 KiB", terminal.frame), terminal.frame
-            assert re.search(r"TX session\s+6 B", terminal.frame), terminal.frame
+            assert re.search(r"累计接收\s+4\.00 KiB", terminal.frame), terminal.frame
+            assert re.search(r"累计发送\s+6 B", terminal.frame), terminal.frame
             terminal.key("q")
             terminal.finish()
         finally:

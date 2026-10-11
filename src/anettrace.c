@@ -157,7 +157,7 @@ static void do_parse_args(int argc, char *argv[])
 		{
 			.lname = "traffic", .dest = &trace_args->traffic,
 			.type = OPTION_BOOL,
-			.desc = "show TCP/UDP rates and totals in a terminal (p: processes, f: flows, q: quit)",
+			.desc = "show TCP/UDP rates and totals (f: threads, p: processes, j/k: scroll, q: quit)",
 		},
 		{
 			.lname = "interval", .dest = &trace_args->traffic_interval,

@@ -52,12 +52,49 @@ static void traffic_format_bytes(double bytes, bool rate, char *text, size_t siz
 	snprintf(text, size, "%.*f %s%s", precision, bytes, units[unit], rate ? "/s" : "");
 }
 
-/* All external text is bounded ASCII, so byte and terminal-column counts agree. */
+/* Recognize the CJK block used by labels without changing the process locale. */
+static unsigned int traffic_character_cells(const char *text, size_t length,
+					     unsigned int *bytes)
+{
+	unsigned char c = text[0];
+
+	*bytes = 1;
+	if (c >= 0xe4 && c <= 0xe9 && length >= 3 &&
+	    ((unsigned char)text[1] & 0xc0) == 0x80 &&
+	    ((unsigned char)text[2] & 0xc0) == 0x80) {
+		unsigned int codepoint = ((c & 0x0f) << 12) |
+			(((unsigned char)text[1] & 0x3f) << 6) |
+			((unsigned char)text[2] & 0x3f);
+
+		if (codepoint >= 0x4e00 && codepoint <= 0x9fff) {
+			*bytes = 3;
+			return 2;
+		}
+	}
+	return 1;
+}
+
+/* printf pads bytes, while the terminal displays CJK names using two cells. */
+static int traffic_comm_field_width(const char *comm)
+{
+	size_t length = strlen(comm), i = 0;
+	int width = 16;
+
+	while (i < length) {
+		unsigned int bytes, cells = traffic_character_cells(comm + i, length - i, &bytes);
+
+		width += bytes - cells;
+		i += bytes;
+	}
+	return width;
+}
+
+/* ASCII uses one cell, CJK labels use two; escape other/control bytes. */
 static void traffic_line(struct traffic_frame *frame, const char *color,
 			 const char *format, ...)
 {
-	char text[1024];
-	size_t length, i, available;
+	char text[1024], clean[1024];
+	size_t length, i = 0, used = 0, columns = 0, fit = 0, ellipsis = 0, available;
 	va_list args;
 
 	if (frame->used >= frame->limit)
@@ -66,20 +103,35 @@ static void traffic_line(struct traffic_frame *frame, const char *color,
 	vsnprintf(text, sizeof(text), format, args);
 	va_end(args);
 	length = strlen(text);
-	for (i = 0; i < length; i++)
-		if ((unsigned char)text[i] < 32 || (unsigned char)text[i] > 126)
-			text[i] = '?';
 	available = frame->width ? frame->width - 1 : 0;
-	if (length > available) {
-		length = available;
-		if (length >= 3)
-			memcpy(text + length - 3, "...", 3);
+	while (i < length) {
+		unsigned char c = text[i];
+		unsigned int bytes, cells = traffic_character_cells(text + i, length - i, &bytes);
+		bool printable = cells == 2 || (c >= 32 && c <= 126);
+		if (printable)
+			memcpy(clean + used, text + i, bytes);
+		else
+			clean[used] = '?';
+		used += bytes;
+		i += bytes;
+		columns += cells;
+		if (columns <= available)
+			fit = used;
+		if (columns + 3 <= available)
+			ellipsis = used;
 	}
-	text[length] = '\0';
+	if (columns > available) {
+		used = available >= 3 ? ellipsis : fit;
+		if (available >= 3) {
+			memcpy(clean + used, "...", 3);
+			used += 3;
+		}
+	}
+	clean[used] = '\0';
 	fputs("\033[2K", stdout);
 	if (color)
 		fputs(color, stdout);
-	fputs(text, stdout);
+	fputs(clean, stdout);
 	fputs(COLOR_RESET "\r\n", stdout);
 	frame->used++;
 }
@@ -152,6 +204,8 @@ static unsigned int traffic_row_lines(const struct traffic_display_row *row,
 		lines += traffic_endpoint_lines(row->local, width);
 		lines += traffic_endpoint_lines(row->remote, width);
 	}
+	if (!wide && width < 40)
+		lines += 2;
 	return lines + spacing;
 }
 
@@ -171,14 +225,16 @@ static void traffic_render_row(struct traffic_frame *frame,
 		snprintf(status, sizeof(status), "%u recent flows", row->flow_count);
 	if (wide) {
 		if (flows) {
-			traffic_line(frame, NULL, "%-7u %-16.16s %-7u %-3.3s %12s %12s %11s %11s",
-				     row->tid, row->comm, row->pid, row->protocol,
+			traffic_line(frame, NULL, "%-7u %-*.16s %-7u %-3.3s %12s %12s %11s %11s",
+				     row->tid, traffic_comm_field_width(row->comm), row->comm,
+				     row->pid, row->protocol,
 				     rx, tx, rx_total, tx_total);
 			traffic_render_endpoint(frame, "Local", row->local);
 			traffic_render_endpoint(frame, "Remote", row->remote);
 		} else {
-			traffic_line(frame, NULL, "%-7u %-16.16s %12s %12s %11s %11s %s",
-				     row->pid, row->comm, rx, tx, rx_total, tx_total, status);
+			traffic_line(frame, NULL, "%-7u %-*.16s %12s %12s %11s %11s %s",
+				     row->pid, traffic_comm_field_width(row->comm), row->comm,
+				     rx, tx, rx_total, tx_total, status);
 		}
 	} else {
 		if (flows) {
@@ -192,8 +248,15 @@ static void traffic_render_row(struct traffic_frame *frame,
 			traffic_render_endpoint(frame, "Local", row->local);
 			traffic_render_endpoint(frame, "Remote", row->remote);
 		}
-		traffic_line(frame, COLOR_RX, " RX %-12s | %s", rx, rx_total);
-		traffic_line(frame, COLOR_TX, " TX %-12s | %s", tx, tx_total);
+		if (frame->width < 40) {
+			traffic_line(frame, COLOR_RX, "接收速率  %s", rx);
+			traffic_line(frame, COLOR_TX, "发送速率  %s", tx);
+			traffic_line(frame, NULL, "累计接收  %s", rx_total);
+			traffic_line(frame, NULL, "累计发送  %s", tx_total);
+		} else {
+			traffic_line(frame, COLOR_RX, "RX %-12s | 累计接收 %s", rx, rx_total);
+			traffic_line(frame, COLOR_TX, "TX %-12s | 累计发送 %s", tx, tx_total);
+		}
 	}
 	if (spacing)
 		traffic_line(frame, NULL, "");
@@ -244,25 +307,25 @@ void traffic_display_render(struct traffic_display *display,
 	traffic_format_bytes(snapshot->tx_rate, true, tx, sizeof(tx));
 	traffic_format_bytes((double)snapshot->rx_bytes, false, rx_total, sizeof(rx_total));
 	traffic_format_bytes((double)snapshot->tx_bytes, false, tx_total, sizeof(tx_total));
-	traffic_line(&frame, COLOR_RX, "RX now      %s", rx);
-	traffic_line(&frame, COLOR_MUTED, "RX session  %s", rx_total);
-	traffic_line(&frame, COLOR_TX, "TX now      %s", tx);
-	traffic_line(&frame, COLOR_MUTED, "TX session  %s", tx_total);
+	traffic_line(&frame, COLOR_TITLE, "当前速率");
+	traffic_line(&frame, COLOR_RX, "RX  %s", rx);
+	traffic_line(&frame, COLOR_TX, "TX  %s", tx);
+	traffic_line(&frame, COLOR_MUTED, "本次累计");
+	traffic_line(&frame, NULL, "累计接收  %s", rx_total);
+	traffic_line(&frame, NULL, "累计发送  %s", tx_total);
 	traffic_line(&frame, NULL, "");
 	wide = frame.width >= (snapshot->flows ? 110 : 100);
 	spacing = !wide && frame.limit >= 30;
 	if (wide && snapshot->flows)
-		traffic_line(&frame, COLOR_MUTED, "%-7s %-16s %-7s %-3s %12s %12s %11s %11s",
-			     "TID", "THREAD", "PID", "P", "RX/s", "TX/s",
-			     "RX retained", "TX retained");
+		traffic_line(&frame, COLOR_MUTED,
+			     "%-7s %-16s %-7s %-3s     接收速率     发送速率    累计接收    累计发送",
+			     "TID", "THREAD", "PID", "P");
 	else if (wide)
-		traffic_line(&frame, COLOR_MUTED, "%-7s %-16s %12s %12s %11s %11s %s",
-			     "PID", "COMMAND", "RX/s", "TX/s",
-			     snapshot->flows ? "RX retained" : "RX session",
-			     snapshot->flows ? "TX retained" : "TX session", "RECENT");
+		traffic_line(&frame, COLOR_MUTED,
+			     "%-7s %-16s     接收速率     发送速率    累计接收    累计发送 %s",
+			     "PID", "COMMAND", "RECENT");
 	else
-		traffic_line(&frame, COLOR_MUTED, snapshot->flows ?
-			     "Thread / endpoint: rate | total" : "Per process: rate | session total");
+		traffic_line(&frame, COLOR_MUTED, "明细: 当前速率 | 累计量");
 	warning_lines = traffic_warning_lines(snapshot->warning, frame.width);
 	/* Reserve the overflow indicator, payload semantics and controls. */
 	footer_lines = display->input_saved && frame.width < 44 ? 4 : 3;
