@@ -116,7 +116,7 @@ assert(history.count==1000 && !history.full);
 ''')
 
     def test_old_generation_cannot_recount_a_rebuilt_record(self):
-        self.run_case(''' 
+        self.run_case('''
 assert(traffic_history_open(&history,2,sizeof(key)));
 traffic_history_begin(&history,"2026-10-12 00:00:01",1000000000,1000000000);
 struct traffic_history_record *record=traffic_history_update(&history,&key,&row);
