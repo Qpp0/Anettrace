@@ -221,7 +221,7 @@ class TrafficDisplayTests(unittest.TestCase):
         self.assertIn(b"16.0 MiB/s", visible)
         self.assertIn(b"5.00 GiB", visible)
         self.assertIn(b"recent flows", visible)
-        self.assertIn(b"more", visible)
+        self.assertIn("未显示".encode(), visible)
         self.assertNotIn(b"\a", visible)
         os.write(master, b"f")
         self.message(process, b"KEY f\n")
@@ -288,7 +288,7 @@ class TrafficDisplayTests(unittest.TestCase):
             self.message(process, b"KEY j\n")
             visible = self.assert_frame_fits(self.drain(master), 44, 45)
         self.assertIn(b"TID 4311 download-worker", visible)
-        self.assertIn(b"Rows 12-12/12", visible)
+        self.assertIn("记录 12-12/12".encode(), visible)
         os.write(master, b"k")
         self.message(process, b"KEY k\n")
         self.assertIn(b"TID 4310 download-worker", self.drain(master))
@@ -296,7 +296,7 @@ class TrafficDisplayTests(unittest.TestCase):
         self.message(process, b"KEY p\n")
         visible = self.drain(master)
         self.assertIn(b"PROCESS VIEW", visible)
-        self.assertIn(b"Rows 1-", visible)
+        self.assertIn("记录 1-".encode(), visible)
         os.write(master, b"q")
         self.message(process, b"KEY q\n")
         process.wait(timeout=3)
@@ -315,6 +315,24 @@ class TrafficDisplayTests(unittest.TestCase):
                 self.assertNotIn(b"TX retained", visible)
                 self.assertIn(b"16.0 MiB/s", visible)
                 self.assertIn(b"5.00 GiB", visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
+
+    def test_chinese_footer_wraps_and_stays_complete_on_phone(self):
+        for columns, rows in ((32, 45), (40, 45), (44, 24), (64, 24), (110, 45), (44, 20)):
+            with self.subTest(columns=columns, rows=rows):
+                process, master, slave, original = self.start_terminal(
+                    columns=columns, rows=rows, mode="threads")
+                self.message(process, b"READY\n")
+                visible = self.assert_frame_fits(self.drain(master), columns, rows).decode()
+                for label in ("记录", "未显示", "Socket 收发字节", "TLS 开销", "PEEK 读取",
+                              "p 进程", "f 线程", "j/k 滚动", "q 退出"):
+                    self.assertIn(label, visible)
+                for old in ("Rows", "more", "Socket I/O bytes", "p process", "q quit"):
+                    self.assertNotIn(old, visible)
+                self.assertNotIn("...", visible)
                 os.write(master, b"q")
                 self.message(process, b"KEY q\n")
                 process.wait(timeout=3)
@@ -340,18 +358,23 @@ class TrafficDisplayTests(unittest.TestCase):
         self.assert_restored(slave, original)
 
     def test_empty_interval_and_long_warning_keep_session_totals_visible(self):
-        process, master, slave, original = self.start_terminal(mode="empty", rows=20)
-        self.message(process, b"READY\n")
-        visible = self.assert_frame_fits(self.drain(master), 44, 20)
-        self.assertIn(b"RX  0 B/s", visible)
-        self.assertIn("累计接收  5.00 GiB".encode(), visible)
-        self.assertIn(b"Waiting for socket traffic", visible)
-        self.assertIn(b"Partial totals", visible)
-        self.assertIn(b"...", visible)
-        os.write(master, b"q")
-        self.message(process, b"KEY q\n")
-        process.wait(timeout=3)
-        self.assert_restored(slave, original)
+        for rows in (20, 24):
+            with self.subTest(rows=rows):
+                process, master, slave, original = self.start_terminal(mode="empty", rows=rows)
+                self.message(process, b"READY\n")
+                visible = self.assert_frame_fits(self.drain(master), 44, rows)
+                self.assertIn(b"RX  0 B/s", visible)
+                self.assertIn("累计接收  5.00 GiB".encode(), visible)
+                if rows == 24:
+                    self.assertIn("等待 Socket 收发".encode(), visible)
+                self.assertIn(b"Partial totals", visible)
+                self.assertIn(b"...", visible)
+                for label in ("记录 0-0/0", "未显示 0 条", "PEEK 读取", "q 退出"):
+                    self.assertIn(label.encode(), visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
 
     def test_dumb_terminal_leaves_modes_and_output_alone(self):
         process, master, slave, original = self.start_terminal(term="dumb")
@@ -365,7 +388,7 @@ class TrafficDisplayTests(unittest.TestCase):
         self.assertEqual(termios.tcgetattr(slave), original)
         visible = self.assert_frame_fits(self.drain(master), 44, 45)
         self.assertIn(b"Ctrl-C", visible)
-        self.assertNotIn(b"p process", visible)
+        self.assertNotIn("p 进程".encode(), visible)
         process.stdin.write(b"q")
         process.stdin.flush()
         self.assertFalse(select.select([process.stderr], [], [], .1)[0])

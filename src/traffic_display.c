@@ -290,11 +290,14 @@ void traffic_display_render(struct traffic_display *display,
 		if (window.ws_row)
 			frame.limit = window.ws_row - 1;
 	}
+	/* Reserve complete Chinese footer lines before admitting any detail rows. */
+	footer_lines = (frame.width < 64 ? 4 : 2) +
+		(display->input_saved && frame.width < 44 ? 2 : 1);
 	fputs("\033[H", stdout);
 	traffic_line(&frame, COLOR_TITLE, "ANETTRACE / TRAFFIC LAB");
-	if (frame.width < 32 || frame.limit < 14) {
-		traffic_line(&frame, COLOR_MUTED, "Resize terminal to view traffic");
-		traffic_line(&frame, COLOR_MUTED, display->input_saved ? "q quit | Ctrl-C stop" : "Ctrl-C stop");
+	if (frame.width < 32 || frame.limit < 12 + footer_lines) {
+		traffic_line(&frame, COLOR_MUTED, "请放大终端");
+		traffic_line(&frame, COLOR_MUTED, display->input_saved ? "q 退出" : "Ctrl-C 停止");
 		goto done;
 	}
 	traffic_line(&frame, COLOR_TITLE, "%s  %s  %.0fs",
@@ -327,8 +330,9 @@ void traffic_display_render(struct traffic_display *display,
 	else
 		traffic_line(&frame, COLOR_MUTED, "明细: 当前速率 | 累计量");
 	warning_lines = traffic_warning_lines(snapshot->warning, frame.width);
-	/* Reserve the overflow indicator, payload semantics and controls. */
-	footer_lines = display->input_saved && frame.width < 44 ? 4 : 3;
+	/* A short terminal must still leave room for every footer control. */
+	if (warning_lines > frame.limit - frame.used - footer_lines)
+		warning_lines = frame.limit - frame.used - footer_lines;
 	available = frame.limit > frame.used + warning_lines + footer_lines ?
 		frame.limit - frame.used - warning_lines - footer_lines : 0;
 	if (!snapshot->row_count)
@@ -348,11 +352,18 @@ void traffic_display_render(struct traffic_display *display,
 		shown++;
 	}
 	if (!snapshot->row_count && available)
-		traffic_line(&frame, COLOR_MUTED, "Waiting for socket traffic...");
-	traffic_line(&frame, COLOR_MUTED, "Rows %zu-%zu/%zu | %zu more",
-		     shown ? display->first_row + 1 : 0,
-		     shown ? display->first_row + shown : 0,
-		     snapshot->row_count, snapshot->row_count - shown);
+		traffic_line(&frame, COLOR_MUTED, "等待 Socket 收发...");
+	if (frame.width < 64) {
+		traffic_line(&frame, COLOR_MUTED, "记录 %zu-%zu/%zu",
+			     shown ? display->first_row + 1 : 0,
+			     shown ? display->first_row + shown : 0, snapshot->row_count);
+		traffic_line(&frame, COLOR_MUTED, "未显示 %zu 条", snapshot->row_count - shown);
+	} else {
+		traffic_line(&frame, COLOR_MUTED, "记录 %zu-%zu/%zu | 未显示 %zu 条",
+			     shown ? display->first_row + 1 : 0,
+			     shown ? display->first_row + shown : 0,
+			     snapshot->row_count, snapshot->row_count - shown);
+	}
 	for (i = 0; i < warning_lines; i++) {
 		size_t offset = (size_t)i * (frame.width - 1);
 		const char *suffix = snapshot->warning + offset;
@@ -362,13 +373,18 @@ void traffic_display_render(struct traffic_display *display,
 		else
 			traffic_line(&frame, COLOR_MUTED, "%.*s", (int)frame.width - 1, suffix);
 	}
-	traffic_line(&frame, COLOR_MUTED, "Socket I/O bytes; includes TLS / PEEK");
+	if (frame.width < 64) {
+		traffic_line(&frame, COLOR_MUTED, "统计: Socket 收发字节");
+		traffic_line(&frame, COLOR_MUTED, "含 TLS 开销及 PEEK 读取");
+	} else {
+		traffic_line(&frame, COLOR_MUTED, "统计: Socket 收发字节; 含 TLS 开销及 PEEK 读取");
+	}
 	if (display->input_saved && frame.width < 44) {
-		traffic_line(&frame, COLOR_MUTED, "p process | f threads | q quit");
-		traffic_line(&frame, COLOR_MUTED, "j next row | k previous row");
+		traffic_line(&frame, COLOR_MUTED, "p 进程 | f 线程 | q 退出");
+		traffic_line(&frame, COLOR_MUTED, "j/k 滚动");
 	} else {
 		traffic_line(&frame, COLOR_MUTED, display->input_saved ?
-			     "p process | f threads | j/k rows | q quit" : "Ctrl-C stop");
+			     "p 进程 | f 线程 | j/k 滚动 | q 退出" : "Ctrl-C 停止");
 	}
 done:
 	fputs("\033[J", stdout);
