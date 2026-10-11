@@ -119,6 +119,14 @@ jobs:
             /tmp/traffic-proto.txt
       - name: Run source contract checks
         run: ./tests/source-contracts.sh
+      - name: Test traffic accounting and terminal presentation
+        run: |
+          python3 -m unittest \
+            tests/test_traffic_accounting.py \
+            tests/test_traffic_display.py \
+            tests/test_traffic_samples.py
+      - name: Verify live traffic terminal controls and totals
+        run: sudo python3 tests/traffic_ui_integration.py ./src/anettrace
       - name: Verify UDP endpoints and payload counters on the running kernel
         run: |
           sudo python3 tests/traffic_udp_integration.py ./src/anettrace

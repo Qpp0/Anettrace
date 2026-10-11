@@ -16,6 +16,7 @@
 
 #include "output.h"
 #include "traffic.h"
+#include "traffic_display.h"
 #include "progs/traffic_shared.h"
 
 #ifndef NO_BTF
@@ -26,13 +27,30 @@ struct traffic_row {
 	traffic_flow_value_t value;
 };
 
+struct traffic_process_row {
+	traffic_process_key_t key;
+	traffic_process_value_t value;
+};
+
 #define TRAFFIC_MAX_LINKS 15
+#define TRAFFIC_RECENT_NS (10ULL * 1000000000ULL)
 
 struct traffic_session {
 	trace_args_t *args;
 	struct traffic *skel;
 	struct bpf_link *links[TRAFFIC_MAX_LINKS];
 	struct traffic_row *rows;
+	struct traffic_row *previous_rows;
+	struct traffic_process_row *process_rows, *previous_process_rows;
+	struct traffic_display_row *flow_display_rows, *process_display_rows;
+	u32 *process_flow_counts;
+	int previous_row_count, previous_process_count;
+	size_t flow_display_count, process_display_count;
+	struct traffic_display display;
+	struct traffic_display_snapshot snapshot;
+	traffic_flow_value_t previous_totals;
+	u64 start_ns, totals_sample_ns;
+	char filter[64], warning[384];
 	u64 previous_drops[TRAFFIC_STAT_MAX];
 	u64 last_report_ns;
 	u64 next_report_ns;
@@ -74,6 +92,163 @@ static int traffic_row_compare(const void *left, const void *right)
 	return 0;
 }
 
+static int traffic_flow_key_compare(const void *left, const void *right)
+{
+	const struct traffic_row *a = left, *b = right;
+
+	return memcmp(&a->key, &b->key, sizeof(a->key));
+}
+
+static int traffic_process_key_compare(const void *left, const void *right)
+{
+	const struct traffic_process_row *a = left, *b = right;
+
+	return memcmp(&a->key, &b->key, sizeof(a->key));
+}
+
+static int traffic_unique_flows(struct traffic_row *rows, int count)
+{
+	int i, unique = 0;
+
+	qsort(rows, count, sizeof(*rows), traffic_flow_key_compare);
+	for (i = 0; i < count; i++) {
+		if (unique && !traffic_flow_key_compare(&rows[unique - 1], &rows[i])) {
+			traffic_flow_value_t *old = &rows[unique - 1].value;
+			traffic_flow_value_t *value = &rows[i].value;
+
+			if (value->first_seen_ns > old->first_seen_ns ||
+			    (value->first_seen_ns == old->first_seen_ns &&
+			     value->last_seen_ns >= old->last_seen_ns))
+				rows[unique - 1] = rows[i];
+		} else {
+			rows[unique++] = rows[i];
+		}
+	}
+	return unique;
+}
+
+static int traffic_unique_processes(struct traffic_process_row *rows, int count)
+{
+	int i, unique = 0;
+
+	qsort(rows, count, sizeof(*rows), traffic_process_key_compare);
+	for (i = 0; i < count; i++) {
+		if (unique && !traffic_process_key_compare(&rows[unique - 1], &rows[i])) {
+			if (rows[i].value.counters.last_seen_ns >=
+			    rows[unique - 1].value.counters.last_seen_ns)
+				rows[unique - 1] = rows[i];
+		} else {
+			rows[unique++] = rows[i];
+		}
+	}
+	return unique;
+}
+
+static void traffic_sample_deltas(const traffic_flow_value_t *value,
+		const traffic_flow_value_t *previous, u64 since_ns,
+		u64 *rx, u64 *tx, bool *incomplete)
+{
+	*rx = *tx = 0;
+	if (previous && value->first_seen_ns == previous->first_seen_ns) {
+		if (value->rx_bytes < previous->rx_bytes ||
+		    value->tx_bytes < previous->tx_bytes) {
+			*incomplete = true;
+			return;
+		}
+		*rx = value->rx_bytes - previous->rx_bytes;
+		*tx = value->tx_bytes - previous->tx_bytes;
+	} else if (value->first_seen_ns && value->first_seen_ns >= since_ns) {
+		*rx = value->rx_bytes;
+		*tx = value->tx_bytes;
+	} else {
+		/* Missing or rebuilt entries can contain older accumulated bytes. */
+		*incomplete = true;
+	}
+}
+
+static int traffic_display_row_compare(const void *left, const void *right)
+{
+	const struct traffic_display_row *a = left, *b = right;
+	double rate_a = a->rx_rate + a->tx_rate;
+	double rate_b = b->rx_rate + b->tx_rate;
+
+	if (rate_a != rate_b)
+		return rate_a < rate_b ? 1 : -1;
+	if (a->idle_seconds != b->idle_seconds)
+		return a->idle_seconds > b->idle_seconds ? 1 : -1;
+	if (a->pid != b->pid)
+		return a->pid > b->pid ? 1 : -1;
+	return (a->tid > b->tid) - (a->tid < b->tid);
+}
+
+static int traffic_collect_flow_sample(int map_fd, struct traffic_row *rows,
+				       bool *incomplete)
+{
+	traffic_flow_key_t key, next;
+	int count = 0, attempts = 0;
+	int err = bpf_map_get_next_key(map_fd, NULL, &key);
+
+	if (err && errno != ENOENT)
+		*incomplete = true;
+	while (!err && attempts++ < TRAFFIC_MAX_FLOWS * 2) {
+		int next_err = bpf_map_get_next_key(map_fd, &key, &next);
+		int next_errno = errno;
+
+		if (bpf_map_lookup_elem(map_fd, &key, &rows[count].value)) {
+			*incomplete = true;
+		} else {
+			rows[count++].key = key;
+		}
+		if (next_err) {
+			if (next_errno != ENOENT)
+				*incomplete = true;
+			break;
+		}
+		if (count == TRAFFIC_MAX_FLOWS) {
+			*incomplete = true;
+			break;
+		}
+		key = next;
+	}
+	if (attempts > TRAFFIC_MAX_FLOWS * 2)
+		*incomplete = true;
+	return traffic_unique_flows(rows, count);
+}
+
+static int traffic_collect_process_sample(int map_fd,
+		struct traffic_process_row *rows, bool *incomplete)
+{
+	traffic_process_key_t key, next;
+	int count = 0, attempts = 0;
+	int err = bpf_map_get_next_key(map_fd, NULL, &key);
+
+	if (err && errno != ENOENT)
+		*incomplete = true;
+	while (!err && attempts++ < TRAFFIC_MAX_PROCESSES * 2) {
+		int next_err = bpf_map_get_next_key(map_fd, &key, &next);
+		int next_errno = errno;
+
+		if (bpf_map_lookup_elem(map_fd, &key, &rows[count].value)) {
+			*incomplete = true;
+		} else {
+			rows[count++].key = key;
+		}
+		if (next_err) {
+			if (next_errno != ENOENT)
+				*incomplete = true;
+			break;
+		}
+		if (count == TRAFFIC_MAX_PROCESSES) {
+			*incomplete = true;
+			break;
+		}
+		key = next;
+	}
+	if (attempts > TRAFFIC_MAX_PROCESSES * 2)
+		*incomplete = true;
+	return traffic_unique_processes(rows, count);
+}
+
 static const char *traffic_protocol_name(u8 protocol)
 {
 	if (protocol == IPPROTO_TCP)
@@ -88,10 +263,10 @@ static int traffic_collect_rows(int map_fd, struct traffic_row *rows,
 {
 	traffic_flow_key_t key, next;
 	traffic_flow_value_t value;
-	int count = 0, err;
+	int count = 0, err, attempts = 0;
 
 	err = bpf_map_get_next_key(map_fd, NULL, &key);
-	while (!err) {
+	while (!err && attempts++ < TRAFFIC_MAX_FLOWS * 2) {
 		bool has_next = bpf_map_get_next_key(map_fd, &key, &next) == 0;
 
 		if (!bpf_map_lookup_elem(map_fd, &key, &value)) {
@@ -110,6 +285,8 @@ static int traffic_collect_rows(int map_fd, struct traffic_row *rows,
 			break;
 		key = next;
 	}
+	if (attempts > TRAFFIC_MAX_FLOWS * 2)
+		pr_warn("traffic: flow snapshot incomplete during concurrent map updates\n");
 
 	return count;
 }
@@ -197,6 +374,172 @@ static int traffic_print_snapshot(struct traffic *skel, trace_args_t *args,
 	return count;
 }
 
+static void traffic_render_cached(struct traffic_session *session)
+{
+	session->snapshot.rows = session->snapshot.flows ?
+		session->flow_display_rows : session->process_display_rows;
+	session->snapshot.row_count = session->snapshot.flows ?
+		session->flow_display_count : session->process_display_count;
+	traffic_display_render(&session->display, &session->snapshot);
+}
+
+static void traffic_display_counters(struct traffic_display_row *row,
+		const traffic_flow_value_t *value, const traffic_flow_value_t *previous,
+		u64 since_ns, u64 now_ns, bool *incomplete)
+{
+	u64 rx, tx;
+
+	traffic_sample_deltas(value, previous, since_ns, &rx, &tx, incomplete);
+	row->rx_bytes = value->rx_bytes;
+	row->tx_bytes = value->tx_bytes;
+	row->rx_rate = traffic_bytes_per_second(rx, now_ns - since_ns);
+	row->tx_rate = traffic_bytes_per_second(tx, now_ns - since_ns);
+	row->idle_seconds = now_ns > value->last_seen_ns ?
+		(now_ns - value->last_seen_ns) / 1000000000.0 : 0;
+}
+
+static void traffic_sample_warning(struct traffic_session *session,
+				   bool read_error, bool sample_gap)
+{
+	static const char *labels[TRAFFIC_STAT_MAX] = {
+		[TRAFFIC_STAT_INFLIGHT_DROP] = "inflight lost (total incomplete)",
+		[TRAFFIC_STAT_FLOW_DROP] = "flow detail lost",
+		[TRAFFIC_STAT_UDP_ENDPOINT_MISS] = "UDP endpoints unknown",
+		[TRAFFIC_STAT_PROCESS_DROP] = "process samples lost",
+		[TRAFFIC_STAT_PROCESS_ID_MISS] = "process identity missing",
+	};
+	u32 index;
+	size_t used = 0;
+
+	session->warning[0] = '\0';
+	for (index = 0; index < TRAFFIC_STAT_MAX; index++) {
+		u64 count;
+
+		if (bpf_map_lookup_elem(bpf_map__fd(session->skel->maps.traffic_stats),
+					&index, &count)) {
+			read_error = true;
+			continue;
+		}
+		if (count && used < sizeof(session->warning))
+			used += snprintf(session->warning + used,
+				sizeof(session->warning) - used, "%s%llu %s",
+				used ? "; " : "", count, labels[index]);
+	}
+	if (read_error && used < sizeof(session->warning))
+		used += snprintf(session->warning + used, sizeof(session->warning) - used,
+			"%smap read incomplete", used ? "; " : "");
+	if (sample_gap && used < sizeof(session->warning))
+		snprintf(session->warning + used, sizeof(session->warning) - used,
+			"%ssample gap: affected rates unavailable", used ? "; " : "");
+}
+
+static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
+{
+	traffic_flow_value_t totals;
+	struct traffic_row *flow_swap;
+	struct traffic_process_row *process_swap;
+	bool read_error = false, sample_gap = false;
+	u32 index = 0;
+	int flow_count, process_count, i;
+
+	/* Sample the header before map walks so its elapsed interval stays accurate. */
+	session->snapshot.rx_rate = session->snapshot.tx_rate = 0;
+	if (bpf_map_lookup_elem(bpf_map__fd(session->skel->maps.traffic_totals),
+				&index, &totals)) {
+		read_error = true;
+	} else {
+		session->snapshot.rx_bytes = totals.rx_bytes;
+		session->snapshot.tx_bytes = totals.tx_bytes;
+		if (totals.rx_bytes < session->previous_totals.rx_bytes ||
+		    totals.tx_bytes < session->previous_totals.tx_bytes) {
+			sample_gap = true;
+		} else {
+			session->snapshot.rx_rate = traffic_bytes_per_second(
+				totals.rx_bytes - session->previous_totals.rx_bytes,
+				now_ns - session->totals_sample_ns);
+			session->snapshot.tx_rate = traffic_bytes_per_second(
+				totals.tx_bytes - session->previous_totals.tx_bytes,
+				now_ns - session->totals_sample_ns);
+		}
+		session->previous_totals = totals;
+		session->totals_sample_ns = now_ns;
+	}
+	flow_count = traffic_collect_flow_sample(
+		bpf_map__fd(session->skel->maps.traffic_flows), session->rows, &read_error);
+	process_count = traffic_collect_process_sample(
+		bpf_map__fd(session->skel->maps.traffic_processes), session->process_rows,
+		&read_error);
+	memset(session->process_flow_counts, 0,
+		TRAFFIC_MAX_PROCESSES * sizeof(*session->process_flow_counts));
+	session->flow_display_count = session->process_display_count = 0;
+	for (i = 0; i < flow_count; i++) {
+		struct traffic_row *current = &session->rows[i], *previous;
+		struct traffic_process_row process_key = {
+			.key = {.tgid = current->key.tgid,
+				.start_time_ns = current->key.process_start_ns},
+		}, *process;
+		struct traffic_display_row *row;
+
+		if (!current->value.last_seen_ns ||
+		    (now_ns > current->value.last_seen_ns &&
+		     now_ns - current->value.last_seen_ns > TRAFFIC_RECENT_NS))
+			continue;
+		process = bsearch(&process_key, session->process_rows, process_count,
+			sizeof(*process), traffic_process_key_compare);
+		if (process)
+			session->process_flow_counts[process - session->process_rows]++;
+		previous = bsearch(current, session->previous_rows, session->previous_row_count,
+			sizeof(*previous), traffic_flow_key_compare);
+		row = &session->flow_display_rows[session->flow_display_count++];
+		memset(row, 0, sizeof(*row));
+		row->pid = current->key.tgid;
+		row->tid = current->key.tid;
+		snprintf(row->comm, sizeof(row->comm), "%.16s", current->key.comm);
+		snprintf(row->protocol, sizeof(row->protocol), "%s",
+			traffic_protocol_name(current->key.protocol));
+		traffic_format_endpoint(current, true, row->local, sizeof(row->local));
+		traffic_format_endpoint(current, false, row->remote, sizeof(row->remote));
+		traffic_display_counters(row, &current->value,
+			previous ? &previous->value : NULL, session->last_report_ns,
+			now_ns, &sample_gap);
+	}
+	for (i = 0; i < process_count; i++) {
+		struct traffic_process_row *current = &session->process_rows[i], *previous;
+		traffic_flow_value_t *value = &current->value.counters;
+		struct traffic_display_row *row;
+
+		if (!value->last_seen_ns || (now_ns > value->last_seen_ns &&
+		    now_ns - value->last_seen_ns > TRAFFIC_RECENT_NS))
+			continue;
+		previous = bsearch(current, session->previous_process_rows,
+			session->previous_process_count, sizeof(*previous), traffic_process_key_compare);
+		row = &session->process_display_rows[session->process_display_count++];
+		memset(row, 0, sizeof(*row));
+		row->pid = current->key.tgid;
+		row->flow_count = session->process_flow_counts[i];
+		snprintf(row->comm, sizeof(row->comm), "%.16s", current->value.comm);
+		traffic_display_counters(row, value,
+			previous ? &previous->value.counters : NULL,
+			session->last_report_ns, now_ns, &sample_gap);
+	}
+	qsort(session->flow_display_rows, session->flow_display_count,
+		sizeof(*session->flow_display_rows), traffic_display_row_compare);
+	qsort(session->process_display_rows, session->process_display_count,
+		sizeof(*session->process_display_rows), traffic_display_row_compare);
+	session->snapshot.elapsed_seconds = (now_ns - session->start_ns) / 1000000000.0;
+	traffic_sample_warning(session, read_error, sample_gap);
+	/* Retain every observed entry as a baseline, including hidden idle rows. */
+	flow_swap = session->previous_rows;
+	session->previous_rows = session->rows;
+	session->rows = flow_swap;
+	session->previous_row_count = flow_count;
+	process_swap = session->previous_process_rows;
+	session->previous_process_rows = session->process_rows;
+	session->process_rows = process_swap;
+	session->previous_process_count = process_count;
+	traffic_render_cached(session);
+}
+
 static void traffic_report_drops(struct traffic *skel, u64 *previous)
 {
 	int map_fd = bpf_map__fd(skel->maps.traffic_stats);
@@ -212,6 +555,11 @@ static void traffic_report_drops(struct traffic *skel, u64 *previous)
 			pr_warn("traffic: %llu UDP samples have unknown endpoints (?)"
 				"; payload counters are retained\n",
 				current - previous[index]);
+		else if (index == TRAFFIC_STAT_PROCESS_DROP ||
+			 index == TRAFFIC_STAT_PROCESS_ID_MISS)
+			pr_warn("traffic: %llu samples missing process attribution (%s)\n",
+				current - previous[index],
+				index == TRAFFIC_STAT_PROCESS_DROP ? "process map" : "identity");
 		else
 			pr_warn("traffic: %llu samples dropped in %s map\n",
 				current - previous[index],
@@ -351,7 +699,14 @@ static void traffic_release(void)
 	for (i = 0; i < session->link_count; i++)
 		bpf_link__destroy(session->links[i]);
 	traffic__destroy(session->skel);
+	traffic_display_close(&session->display, &session->snapshot);
 	free(session->rows);
+	free(session->previous_rows);
+	free(session->process_rows);
+	free(session->previous_process_rows);
+	free(session->flow_display_rows);
+	free(session->process_display_rows);
+	free(session->process_flow_counts);
 	memset(session, 0, sizeof(*session));
 }
 
@@ -363,16 +718,23 @@ static bool traffic_tick(bool force)
 	if (!session->active || session->limit_reached)
 		return session->limit_reached;
 	now_ns = traffic_monotonic_ns();
+	if (!now_ns || now_ns < session->last_report_ns)
+		return false;
 	if (!force && now_ns < session->next_report_ns)
 		return false;
 
-	traffic_print_snapshot(session->skel, session->args, session->rows,
-			       session->last_report_ns, now_ns);
-	traffic_report_drops(session->skel, session->previous_drops);
+	if (session->display.active) {
+		traffic_sample_display(session, now_ns);
+	} else {
+		traffic_print_snapshot(session->skel, session->args, session->rows,
+				       session->last_report_ns, now_ns);
+		traffic_report_drops(session->skel, session->previous_drops);
+	}
 	session->last_report_ns = now_ns;
 	session->next_report_ns = now_ns +
 		(u64)session->args->traffic_interval * 1000000000ULL;
-	session->reports++;
+	if (!force)
+		session->reports++;
 	session->limit_reached = session->args->count &&
 		session->reports >= session->args->count;
 	return session->limit_reached;
@@ -400,6 +762,24 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 		pr_err("traffic: failed to allocate flow rows\n");
 		goto out;
 	}
+	if (isatty(STDOUT_FILENO)) {
+		session->previous_rows = calloc(TRAFFIC_MAX_FLOWS, sizeof(*session->previous_rows));
+		session->process_rows = calloc(TRAFFIC_MAX_PROCESSES, sizeof(*session->process_rows));
+		session->previous_process_rows = calloc(TRAFFIC_MAX_PROCESSES,
+			sizeof(*session->previous_process_rows));
+		session->flow_display_rows = calloc(TRAFFIC_MAX_FLOWS,
+			sizeof(*session->flow_display_rows));
+		session->process_display_rows = calloc(TRAFFIC_MAX_PROCESSES,
+			sizeof(*session->process_display_rows));
+		session->process_flow_counts = calloc(TRAFFIC_MAX_PROCESSES,
+			sizeof(*session->process_flow_counts));
+		if (!session->previous_rows || !session->process_rows ||
+		    !session->previous_process_rows || !session->flow_display_rows ||
+		    !session->process_display_rows || !session->process_flow_counts) {
+			pr_err("traffic: failed to allocate interactive snapshots\n");
+			goto out;
+		}
+	}
 
 	session->skel = traffic__open_opts(&opts);
 	if (!session->skel) {
@@ -416,11 +796,17 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 		pr_err("traffic: failed to load BPF programs\n");
 		goto out;
 	}
+	/* Loaded maps are empty. Include all bytes collected while attaching. */
+	session->start_ns = session->last_report_ns = traffic_monotonic_ns();
+	if (!session->start_ns) {
+		pr_err("traffic: cannot read the monotonic clock\n");
+		goto out;
+	}
+	session->totals_sample_ns = session->start_ns;
 	if (traffic_attach_probes(session->skel, bpf_args->pkt.l4_proto,
 				  session->links, &session->link_count))
 		goto out;
 
-	session->last_report_ns = traffic_monotonic_ns();
 	session->next_report_ns = session->last_report_ns +
 		(u64)args->traffic_interval * 1000000000ULL;
 	session->active = true;
@@ -432,6 +818,22 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 		"Wireshark wire bytes also include headers, control packets, and retransmits.\n");
 	if (args->capture_trace)
 		pr_info("Trace capture runs in the background while traffic remains on stdout.\n");
+	session->snapshot.protocol = bpf_args->pkt.l4_proto ?
+		traffic_protocol_name(bpf_args->pkt.l4_proto) : "TCP/UDP";
+	if (bpf_args->pid && bpf_args->uid_enabled)
+		snprintf(session->filter, sizeof(session->filter), "TID %u / UID %u",
+			bpf_args->pid, bpf_args->uid);
+	else if (bpf_args->pid)
+		snprintf(session->filter, sizeof(session->filter), "TID %u", bpf_args->pid);
+	else if (bpf_args->uid_enabled)
+		snprintf(session->filter, sizeof(session->filter), "UID %u", bpf_args->uid);
+	else
+		snprintf(session->filter, sizeof(session->filter), "all processes");
+	session->snapshot.filter = session->filter;
+	session->snapshot.warning = session->warning;
+	session->snapshot.interval_seconds = args->traffic_interval;
+	if (traffic_display_open(&session->display))
+		traffic_render_cached(session);
 	return 0;
 
 out:
@@ -441,6 +843,15 @@ out:
 
 bool traffic_poll(void)
 {
+	struct traffic_session *session = &traffic_session;
+	int key = traffic_display_read_key(&session->display);
+
+	if (key == 'q')
+		return true;
+	if (key == 'p' || key == 'f') {
+		session->snapshot.flows = key == 'f';
+		traffic_render_cached(session);
+	}
 	return traffic_tick(false);
 }
 
@@ -455,21 +866,20 @@ void traffic_stop(bool final_report)
 
 int traffic_run(trace_args_t *args, bpf_args_t *bpf_args)
 {
-	if (traffic_start(args, bpf_args))
-		return -1;
-
 	traffic_exiting = 0;
 	signal(SIGTERM, traffic_signal_handler);
 	signal(SIGINT, traffic_signal_handler);
+	if (traffic_start(args, bpf_args))
+		return -1;
 	while (!traffic_exiting) {
 		struct timespec delay = {
-			.tv_sec = args->traffic_interval,
+			.tv_nsec = 100000000,
 		};
 
 		while (nanosleep(&delay, &delay) && errno == EINTR &&
 		       !traffic_exiting)
 			;
-		if (traffic_exiting || traffic_tick(true))
+		if (traffic_exiting || traffic_poll())
 			break;
 	}
 

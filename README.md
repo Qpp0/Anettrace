@@ -4,6 +4,8 @@ Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具�
 
 > 当前正式版：**v0.8.2**。完整安装说明、参数解释、模式组合、Android 抓取和排障指南已经移至 [GitHub Wiki](https://github.com/ron159/Anettrace/wiki)。
 
+> 本分支为 **Traffic UI 实验版**，基于 v0.8.2。终端流量概览增加当前速率、进程汇总和连接明细切换；[实验版使用说明](docs/traffic-overview-experiment.md)包含统计口径和限制。上方正式版本号及下方 Release 下载链接仍指向已发布的稳定版，实验构建以分支和 `--version` 中的 commit 区分。
+
 [下载 v0.8.2](https://github.com/ron159/Anettrace/releases/tag/v0.8.2) · [使用手册](https://github.com/ron159/Anettrace/wiki) · [CLI 完整参考](https://github.com/ron159/Anettrace/wiki/CLI-Reference) · [问题反馈](https://github.com/ron159/Anettrace/issues)
 
 ## 主要功能
@@ -12,7 +14,7 @@ Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具�
 - 地址、端口、协议、网络命名空间、TID、UID 等组合过滤；
 - `--diag` 异常路径分析与 `--drop` 内核丢包定位；
 - TCP RTT、协议栈延迟、Socket 生命周期和 monitor 模式；
-- `--traffic` 按线程与 flow 统计 TCP/UDP 应用层收发字节；
+- `--traffic` 在终端中显示 TCP/UDP 当前速率和累计字节，支持进程汇总与 flow 明细；
 - `--capture-trace` 生成系统 Perfetto 与网络事件联合时间线；
 - `--ring-buffer` 持续抓取并在停止时保存最近 N 秒；
 - Android TCP 主动建连根因诊断与隐私受控报告。
