@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "traffic_display.h"
+#include "traffic_history.h"
 
 #define COLOR_TITLE "\033[1;36m"
 #define COLOR_RX "\033[32m"
@@ -75,10 +76,9 @@ static unsigned int traffic_character_cells(const char *text, size_t length,
 }
 
 /* printf pads bytes, while the terminal displays CJK names using two cells. */
-static int traffic_comm_field_width(const char *comm)
+static int traffic_field_width(const char *comm, int width)
 {
 	size_t length = strlen(comm), i = 0;
-	int width = 16;
 
 	while (i < length) {
 		unsigned int bytes, cells = traffic_character_cells(comm + i, length - i, &bytes);
@@ -166,9 +166,39 @@ int traffic_display_read_key(struct traffic_display *display)
 	if (!display->active || !display->input_saved)
 		return 0;
 	while (consumed++ < 64 && read(STDIN_FILENO, &key, 1) == 1)
-		if (key == 'p' || key == 'f' || key == 'j' || key == 'k' || key == 'q')
+		if (key == 'p' || key == 'f' || key == 'h' || key == 'j' || key == 'k' || key == 'q')
 			return key;
 	return 0;
+}
+
+bool traffic_display_key(struct traffic_display *display,
+			 struct traffic_display_snapshot *snapshot, int key)
+{
+	if (key == 'p' || key == 'f') {
+		snapshot->flows = key == 'f';
+		display->first_row = display->history_scroll = 0;
+		display->history_record = NULL;
+	} else if (key == 'h') {
+		if (display->history_record)
+			display->history_record = NULL;
+		else if (display->first_row < snapshot->row_count)
+			display->history_record = snapshot->rows[display->first_row].record;
+		display->history_scroll = 0;
+	} else if (key == 'j' || key == 'k') {
+		if (display->history_record) {
+			if (key == 'k' && display->history_scroll + 1 < TRAFFIC_HISTORY_SAMPLES)
+				display->history_scroll++;
+			else if (key == 'j' && display->history_scroll)
+				display->history_scroll--;
+		} else if (key == 'j' && display->first_row + 1 < snapshot->row_count) {
+			display->first_row++;
+		} else if (key == 'k' && display->first_row) {
+			display->first_row--;
+		}
+	} else {
+		return false;
+	}
+	return true;
 }
 
 /* Keep complete IPv6 addresses and ports, including in a phone terminal. */
@@ -217,24 +247,34 @@ static void traffic_render_row(struct traffic_frame *frame,
 
 	traffic_format_bytes(row->rx_rate, true, rx, sizeof(rx));
 	traffic_format_bytes(row->tx_rate, true, tx, sizeof(tx));
+	if (row->archived || !row->sample_valid) {
+		snprintf(rx, sizeof(rx), "未知");
+		snprintf(tx, sizeof(tx), "未知");
+	}
 	traffic_format_bytes((double)row->rx_bytes, false, rx_total, sizeof(rx_total));
 	traffic_format_bytes((double)row->tx_bytes, false, tx_total, sizeof(tx_total));
-	if (!row->rx_rate && !row->tx_rate)
+	if (row->archived)
+		snprintf(status, sizeof(status), "旧记录");
+	else if (!row->sample_valid)
+		snprintf(status, sizeof(status), "采样缺失");
+	else if (!row->rx_rate && !row->tx_rate)
 		snprintf(status, sizeof(status), "空闲 %.0fs", row->idle_seconds);
 	else
 		snprintf(status, sizeof(status), "活跃");
 	if (wide) {
 		if (flows) {
-			traffic_line(frame, NULL, "%-7u %-*.16s %-7u %-3.3s %12s %12s %11s %11s",
-				     row->tid, traffic_comm_field_width(row->comm), row->comm,
+			traffic_line(frame, NULL, "%-7u %-*.16s %-7u %-3.3s %*s %*s %11s %11s",
+				     row->tid, traffic_field_width(row->comm, 16), row->comm,
 				     row->pid, row->protocol,
-				     rx, tx, rx_total, tx_total);
+				     traffic_field_width(rx, 12), rx, traffic_field_width(tx, 12), tx,
+				     rx_total, tx_total);
 			traffic_render_endpoint(frame, "Local", row->local);
 			traffic_render_endpoint(frame, "Remote", row->remote);
 		} else {
-			traffic_line(frame, NULL, "%-7u %-*.16s %12s %12s %11s %11s %s",
-				     row->pid, traffic_comm_field_width(row->comm), row->comm,
-				     rx, tx, rx_total, tx_total, status);
+			traffic_line(frame, NULL, "%-7u %-*.16s %*s %*s %11s %11s %s",
+				     row->pid, traffic_field_width(row->comm, 16), row->comm,
+				     traffic_field_width(rx, 12), rx, traffic_field_width(tx, 12), tx,
+				     rx_total, tx_total, status);
 		}
 	} else {
 		if (flows) {
@@ -275,6 +315,77 @@ static unsigned int traffic_warning_lines(const char *warning, unsigned int widt
 	return count > 3 ? 3 : count;
 }
 
+static void traffic_render_history(struct traffic_frame *frame, struct traffic_display *display,
+				   const struct traffic_display_snapshot *snapshot)
+{
+	const struct traffic_history *history = snapshot->history;
+	const struct traffic_history_record *record = display->history_record;
+	unsigned int footer = frame->width < 40 ? 3 : 2;
+	unsigned int detail = traffic_row_lines(&record->row, snapshot->flows, false, false,
+					      frame->width);
+	unsigned int per_sample = frame->width >= 110 ? 1 : 3;
+	uint64_t oldest, end, start, sequence;
+	size_t count, shown;
+
+	if (!history || !history->sequence || frame->limit < frame->used + detail + 2 + footer) {
+		traffic_line(frame, COLOR_MUTED, "请放大终端查看历史");
+		traffic_line(frame, COLOR_MUTED, "h 返回 | q 退出");
+		return;
+	}
+	traffic_render_row(frame, &record->row, snapshot->flows, false, false);
+	traffic_line(frame, COLOR_TITLE, "历史: 最近 60 次采样");
+	traffic_line(frame, COLOR_MUTED, "收发量 / 速率 | 采样结束时间");
+	oldest = history->sequence >= TRAFFIC_HISTORY_SAMPLES ?
+		history->sequence - TRAFFIC_HISTORY_SAMPLES + 1 : 1;
+	if (oldest < record->born_sequence)
+		oldest = record->born_sequence;
+	count = history->sequence - oldest + 1;
+	if (display->history_scroll >= count)
+		display->history_scroll = count - 1;
+	end = history->sequence - display->history_scroll;
+	shown = (frame->limit - frame->used - footer) / per_sample;
+	if (shown > end - oldest + 1)
+		shown = end - oldest + 1;
+	start = end - shown + 1;
+	for (sequence = start; sequence <= end; sequence++) {
+		size_t slot = (sequence - 1) % TRAFFIC_HISTORY_SAMPLES;
+		const struct traffic_history_frame *sample_time = &history->frames[slot];
+		const struct traffic_history_sample *sample = &record->samples[slot];
+		char rx[32], tx[32], rx_rate[32], tx_rate[32];
+
+		traffic_format_bytes((double)sample->rx_bytes, false, rx, sizeof(rx));
+		traffic_format_bytes((double)sample->tx_bytes, false, tx, sizeof(tx));
+		traffic_format_bytes(traffic_bytes_per_second(sample->rx_bytes, sample_time->elapsed_ns),
+				     true, rx_rate, sizeof(rx_rate));
+		traffic_format_bytes(traffic_bytes_per_second(sample->tx_bytes, sample_time->elapsed_ns),
+				     true, tx_rate, sizeof(tx_rate));
+		if (per_sample == 1) {
+			traffic_line(frame, NULL, "%s | %.2fs | RX %s / %s | TX %s / %s",
+				     sample_time->timestamp, sample_time->elapsed_ns / 1000000000.0,
+				     sample->available ? rx : "未知", sample->available ? rx_rate : "未知",
+				     sample->available ? tx : "未知", sample->available ? tx_rate : "未知");
+		} else {
+			traffic_line(frame, COLOR_MUTED, "%s | %.2fs", sample_time->timestamp,
+				     sample_time->elapsed_ns / 1000000000.0);
+			if (!sample->available) {
+				traffic_line(frame, COLOR_MUTED, "本周期数据缺失");
+				traffic_line(frame, NULL, "");
+			} else {
+				traffic_line(frame, COLOR_RX, "RX %s | %s", rx, rx_rate);
+				traffic_line(frame, COLOR_TX, "TX %s | %s", tx, tx_rate);
+			}
+		}
+	}
+	traffic_line(frame, COLOR_MUTED, "历史 %zu-%zu/%zu", shown ? (size_t)(start - oldest + 1) : 0,
+		     shown ? (size_t)(end - oldest + 1) : 0, count);
+	if (frame->width < 40) {
+		traffic_line(frame, COLOR_MUTED, "k 更早 | j 较新");
+		traffic_line(frame, COLOR_MUTED, "h 返回 | q 退出");
+	} else {
+		traffic_line(frame, COLOR_MUTED, "k 更早 | j 较新 | h 返回 | q 退出");
+	}
+}
+
 void traffic_display_render(struct traffic_display *display,
 			    const struct traffic_display_snapshot *snapshot)
 {
@@ -293,8 +404,8 @@ void traffic_display_render(struct traffic_display *display,
 			frame.limit = window.ws_row - 1;
 	}
 	/* Reserve complete Chinese footer lines before admitting any detail rows. */
-	footer_lines = (frame.width < 64 ? 4 : 2) +
-		(display->input_saved && frame.width < 44 ? 2 : 1);
+	footer_lines = (frame.width < 44 ? 2 : 1) + (frame.width < 64 ? 2 : 1) +
+		(display->input_saved && frame.width < 64 ? 2 : 1);
 	fputs("\033[H", stdout);
 	traffic_line(&frame, COLOR_TITLE, "ANETTRACE / TRAFFIC LAB");
 	if (frame.width < 32 || frame.limit < 12 + footer_lines) {
@@ -308,6 +419,10 @@ void traffic_display_render(struct traffic_display *display,
 	traffic_line(&frame, COLOR_MUTED, "%s | every %us",
 		     snapshot->filter ? snapshot->filter : "All processes", snapshot->interval_seconds);
 	traffic_line(&frame, COLOR_MUTED, "时间 %s", snapshot->timestamp);
+	if (display->history_record) {
+		traffic_render_history(&frame, display, snapshot);
+		goto done;
+	}
 	traffic_format_bytes(snapshot->rx_rate, true, rx, sizeof(rx));
 	traffic_format_bytes(snapshot->tx_rate, true, tx, sizeof(tx));
 	traffic_format_bytes((double)snapshot->rx_bytes, false, rx_total, sizeof(rx_total));
@@ -318,7 +433,6 @@ void traffic_display_render(struct traffic_display *display,
 	traffic_line(&frame, COLOR_MUTED, "本次累计");
 	traffic_line(&frame, NULL, "累计接收  %s", rx_total);
 	traffic_line(&frame, NULL, "累计发送  %s", tx_total);
-	traffic_line(&frame, NULL, "");
 	wide = frame.width >= (snapshot->flows ? 110 : 100);
 	spacing = !wide && frame.limit >= 30;
 	if (wide && snapshot->flows)
@@ -328,7 +442,7 @@ void traffic_display_render(struct traffic_display *display,
 	else if (wide)
 		traffic_line(&frame, COLOR_MUTED,
 			     "%-7s %-16s     接收速率     发送速率    累计接收    累计发送 %s",
-			     "PID", "COMMAND", "RECENT");
+			     "PID", "COMMAND", "状态");
 	else
 		traffic_line(&frame, COLOR_MUTED, "明细: 当前速率 | 累计量");
 	warning_lines = traffic_warning_lines(snapshot->warning, frame.width);
@@ -355,7 +469,7 @@ void traffic_display_render(struct traffic_display *display,
 	}
 	if (!snapshot->row_count && available)
 		traffic_line(&frame, COLOR_MUTED, "等待 Socket 收发...");
-	if (frame.width < 64) {
+	if (frame.width < 44) {
 		traffic_line(&frame, COLOR_MUTED, "记录 %zu-%zu/%zu",
 			     shown ? display->first_row + 1 : 0,
 			     shown ? display->first_row + shown : 0, snapshot->row_count);
@@ -381,12 +495,12 @@ void traffic_display_render(struct traffic_display *display,
 	} else {
 		traffic_line(&frame, COLOR_MUTED, "统计: Socket 收发字节; 含 TLS 开销及 PEEK 读取");
 	}
-	if (display->input_saved && frame.width < 44) {
-		traffic_line(&frame, COLOR_MUTED, "p 进程 | f 线程 | q 退出");
-		traffic_line(&frame, COLOR_MUTED, "j/k 滚动");
+	if (display->input_saved && frame.width < 64) {
+		traffic_line(&frame, COLOR_MUTED, "p 进程 | f 线程 | h 历史");
+		traffic_line(&frame, COLOR_MUTED, "j/k 滚动 | q 退出");
 	} else {
 		traffic_line(&frame, COLOR_MUTED, display->input_saved ?
-			     "p 进程 | f 线程 | j/k 滚动 | q 退出" : "Ctrl-C 停止");
+			     "p 进程 | f 线程 | h 历史 | j/k 滚动 | q 退出" : "Ctrl-C 停止");
 	}
 done:
 	fputs("\033[J", stdout);

@@ -25,10 +25,12 @@ HARNESS = r'''
 #include <string.h>
 #include <time.h>
 #include "traffic_display.h"
+#include "traffic_history.h"
 static volatile sig_atomic_t stopped;
 static void stop(int number) { (void)number; stopped = 1; }
 int main(int argc, char **argv) {
     struct traffic_display display = {0};
+    struct traffic_history history = {0};
     struct traffic_display_row rows[12] = {0};
     struct traffic_display_snapshot snapshot = {
         .rows = rows, .row_count = 12,
@@ -58,9 +60,10 @@ int main(int argc, char **argv) {
         rows[i].rx_rate = snapshot.rx_rate;
         rows[i].tx_rate = snapshot.tx_rate;
         rows[i].idle_seconds = i ? 4 : 0;
+        rows[i].sample_valid = true;
         strcpy(rows[i].last_seen, "2026-10-11 23:59:59");
     }
-    if (!strcmp(argv[1], "threads") || !strcmp(argv[1], "chinese") || !strcmp(argv[1], "idle")) {
+    if (!strcmp(argv[1], "threads") || !strcmp(argv[1], "chinese") || !strcmp(argv[1], "idle") || !strcmp(argv[1], "history")) {
         snapshot.flows = true;
         snapshot.row_count = 2;
         rows[0] = rows[1];
@@ -83,6 +86,26 @@ int main(int argc, char **argv) {
             "some retained connection records are unavailable; global counters "
             "remain independent of the connection record cache.";
     }
+    if (!strcmp(argv[1], "history")) {
+        assert(traffic_history_open(&history, 2, sizeof(unsigned)));
+        snapshot.history = &history;
+        for (unsigned tick = 1; tick <= 65; tick++) {
+            char timestamp[20];
+            snprintf(timestamp, sizeof(timestamp), "2026-10-12 00:%02u:%02u", tick / 60, tick % 60);
+            traffic_history_begin(&history, timestamp, (uint64_t)tick * 1000000000,
+                                  tick == 65 ? 1500000000 : 1000000000);
+            for (unsigned i = 0; i < 2; i++) {
+                struct traffic_display_row row = rows[i];
+                row.rx_bytes = tick * 1024 * (i + 1); row.tx_bytes = tick * 16;
+                row.rx_delta = 1024 * (i + 1); row.tx_delta = 16;
+                row.first_seen_ns = 1; row.last_seen_ns = (uint64_t)tick * 1000000000;
+                row.sample_valid = i || tick != 64;
+                strcpy(row.last_seen, timestamp);
+                rows[i] = traffic_history_update(&history, &i, &row)->row;
+            }
+            strcpy(snapshot.timestamp, timestamp);
+        }
+    }
     if (!traffic_display_open(&display)) {
         puts("legacy output");
         traffic_display_close(&display, &snapshot);
@@ -97,13 +120,10 @@ int main(int argc, char **argv) {
             if (key) {
                 fprintf(stderr, "KEY %c\n", key); fflush(stderr);
                 if (key == 'q') break;
-                if (key == 'f' || key == 'p') {
-                    snapshot.flows = key == 'f';
-                    display.first_row = 0;
-                } else if (key == 'j') {
-                    display.first_row++;
-                } else if (key == 'k' && display.first_row) {
-                    display.first_row--;
+                traffic_display_key(&display, &snapshot, key);
+                if (key == 'h' && display.history_record && !strcmp(argv[1], "history")) {
+                    struct traffic_display_row temporary = rows[0];
+                    rows[0] = rows[1]; rows[1] = temporary;
                 }
                 traffic_display_render(&display, &snapshot);
             }
@@ -113,6 +133,7 @@ int main(int argc, char **argv) {
     }
     traffic_display_close(&display, &snapshot);
     traffic_display_close(&display, &snapshot);
+    traffic_history_close(&history);
     return 0;
 }
 '''
@@ -131,6 +152,7 @@ class TrafficDisplayTests(unittest.TestCase):
             os.environ.get("CC", "cc"), "-std=c11", "-D_POSIX_C_SOURCE=200809L",
             "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "src"),
             str(harness), str(ROOT / "src/traffic_display.c"),
+            str(ROOT / "src/traffic_history.c"),
             "-o", str(cls.binary),
         ], check=True, capture_output=True, text=True)
 
@@ -338,6 +360,39 @@ class TrafficDisplayTests(unittest.TestCase):
                              "空闲 308s", "5678", "download-worker", "5.00 GiB"):
                     self.assertIn(text, visible)
                 self.assertIn("0 B/s", visible)
+                os.write(master, b"q")
+                self.message(process, b"KEY q\n")
+                process.wait(timeout=3)
+                self.assert_restored(slave, original)
+
+    def test_timed_history_keeps_selected_thread_and_narrow_controls(self):
+        for columns, rows in ((32, 45), (44, 24), (44, 45), (110, 45)):
+            with self.subTest(columns=columns, rows=rows):
+                process, master, slave, original = self.start_terminal(
+                    columns=columns, rows=rows, mode="history")
+                self.message(process, b"READY\n")
+                self.drain(master)
+                os.write(master, b"h")
+                self.message(process, b"KEY h\n")
+                visible = self.assert_frame_fits(self.drain(master), columns, rows).decode()
+                for text in ("TID 5678", "历史: 最近 60 次采样", "2026-10-12 00:01:05",
+                             "h 返回", "q 退出", "1.00 KiB", "683 B/s"):
+                    self.assertIn(text, visible)
+                self.assertNotIn("TID 5679", visible)
+                self.assertTrue("数据缺失" in visible or "未知" in visible)
+                for _ in range(59):
+                    os.write(master, b"k")
+                    self.message(process, b"KEY k\n")
+                    output = self.drain(master)
+                visible = self.assert_frame_fits(output, columns, rows).decode()
+                self.assertIn("2026-10-12 00:00:06", visible)
+                self.assertIn("TID 5678", visible)
+                os.write(master, b"j")
+                self.message(process, b"KEY j\n")
+                self.assertIn(b"00:00:07", self.drain(master))
+                os.write(master, b"p")
+                self.message(process, b"KEY p\n")
+                self.assertNotIn("历史: 最近".encode(), self.drain(master))
                 os.write(master, b"q")
                 self.message(process, b"KEY q\n")
                 process.wait(timeout=3)

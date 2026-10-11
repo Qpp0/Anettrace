@@ -27,6 +27,7 @@ typedef uint16_t u16;
 typedef uint8_t u8;
 #include "src/progs/traffic_shared.h"
 #include "src/traffic_display.h"
+#include "src/traffic_history.h"
 struct traffic_row { traffic_flow_key_t key; traffic_flow_value_t value; };
 struct traffic_process_row { traffic_process_key_t key; traffic_process_value_t value; };
 '''
@@ -38,7 +39,7 @@ struct traffic_process_row { traffic_process_key_t key; traffic_process_value_t 
             built = subprocess.run([
                 "cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                 "-Wno-unused-function", "-I", str(ROOT), str(cfile),
-                "-o", str(binary),
+                str(ROOT / "src/traffic_history.c"), "-o", str(binary),
             ], capture_output=True, text=True)
             self.assertEqual(built.returncode, 0, built.stderr)
             ran = subprocess.run([str(binary)], capture_output=True, text=True)

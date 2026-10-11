@@ -17,6 +17,7 @@
 #include "output.h"
 #include "traffic.h"
 #include "traffic_display.h"
+#include "traffic_history.h"
 #include "progs/traffic_shared.h"
 
 #ifndef NO_BTF
@@ -47,6 +48,7 @@ struct traffic_session {
 	size_t flow_display_count, process_display_count;
 	struct traffic_display display;
 	struct traffic_display_snapshot snapshot;
+	struct traffic_history flow_history, process_history;
 	traffic_flow_value_t previous_totals;
 	u64 start_ns, totals_sample_ns;
 	char filter[64], warning[384];
@@ -379,6 +381,8 @@ static void traffic_render_cached(struct traffic_session *session)
 		session->flow_display_rows : session->process_display_rows;
 	session->snapshot.row_count = session->snapshot.flows ?
 		session->flow_display_count : session->process_display_count;
+	session->snapshot.history = session->snapshot.flows ?
+		&session->flow_history : &session->process_history;
 	traffic_display_render(&session->display, &session->snapshot);
 }
 
@@ -398,8 +402,15 @@ static void traffic_display_counters(struct traffic_display_row *row,
 		u64 since_ns, u64 now_ns, bool *incomplete)
 {
 	u64 rx, tx;
+	bool gap = false;
 
-	traffic_sample_deltas(value, previous, since_ns, &rx, &tx, incomplete);
+	traffic_sample_deltas(value, previous, since_ns, &rx, &tx, &gap);
+	*incomplete |= gap;
+	row->sample_valid = !gap;
+	row->rx_delta = rx;
+	row->tx_delta = tx;
+	row->first_seen_ns = value->first_seen_ns;
+	row->last_seen_ns = value->last_seen_ns;
 	row->rx_bytes = value->rx_bytes;
 	row->tx_bytes = value->tx_bytes;
 	row->rx_rate = traffic_bytes_per_second(rx, now_ns - since_ns);
@@ -455,6 +466,10 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 
 	/* Sample the header before map walks so its elapsed interval stays accurate. */
 	traffic_format_timestamp(session->snapshot.timestamp, now_ns);
+	traffic_history_begin(&session->flow_history, session->snapshot.timestamp,
+			      now_ns, now_ns - session->last_report_ns);
+	traffic_history_begin(&session->process_history, session->snapshot.timestamp,
+			      now_ns, now_ns - session->last_report_ns);
 	session->snapshot.rx_rate = session->snapshot.tx_rate = 0;
 	if (bpf_map_lookup_elem(bpf_map__fd(session->skel->maps.traffic_totals),
 				&index, &totals)) {
@@ -512,6 +527,7 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 		traffic_display_counters(row, &current->value,
 			previous ? &previous->value : NULL, session->last_report_ns,
 			now_ns, &sample_gap);
+		traffic_history_update(&session->flow_history, &current->key, row);
 	}
 	for (i = 0; i < process_count; i++) {
 		struct traffic_process_row *current = &session->process_rows[i], *previous;
@@ -530,13 +546,28 @@ static void traffic_sample_display(struct traffic_session *session, u64 now_ns)
 		traffic_display_counters(row, value,
 			previous ? &previous->value.counters : NULL,
 			session->last_report_ns, now_ns, &sample_gap);
+		traffic_history_update(&session->process_history, &current->key, row);
 	}
+	/* Keep sampled identities even after the kernel LRU no longer has them. */
+	session->flow_display_count = session->flow_history.count;
+	for (size_t j = 0; j < session->flow_display_count; j++)
+		session->flow_display_rows[j] = session->flow_history.records[j].row;
+	session->process_display_count = session->process_history.count;
+	for (size_t j = 0; j < session->process_display_count; j++)
+		session->process_display_rows[j] = session->process_history.records[j].row;
 	qsort(session->flow_display_rows, session->flow_display_count,
 		sizeof(*session->flow_display_rows), traffic_display_row_compare);
 	qsort(session->process_display_rows, session->process_display_count,
 		sizeof(*session->process_display_rows), traffic_display_row_compare);
 	session->snapshot.elapsed_seconds = (now_ns - session->start_ns) / 1000000000.0;
 	traffic_sample_warning(session, read_error, sample_gap);
+	if (session->flow_history.full || session->process_history.full) {
+		size_t used = strlen(session->warning);
+
+		snprintf(session->warning + used, sizeof(session->warning) - used,
+			 "%sretained record limit reached; new records not retained",
+			 used ? "; " : "");
+	}
 	/* Retain every observed entry as a baseline, including idle rows. */
 	flow_swap = session->previous_rows;
 	session->previous_rows = session->rows;
@@ -716,6 +747,8 @@ static void traffic_release(void)
 	free(session->flow_display_rows);
 	free(session->process_display_rows);
 	free(session->process_flow_counts);
+	traffic_history_close(&session->flow_history);
+	traffic_history_close(&session->process_history);
 	memset(session, 0, sizeof(*session));
 }
 
@@ -786,6 +819,13 @@ int traffic_start(trace_args_t *args, bpf_args_t *bpf_args)
 		    !session->previous_process_rows || !session->flow_display_rows ||
 		    !session->process_display_rows || !session->process_flow_counts) {
 			pr_err("traffic: failed to allocate interactive snapshots\n");
+			goto out;
+		}
+		if (!traffic_history_open(&session->flow_history, TRAFFIC_MAX_FLOWS,
+					 sizeof(traffic_flow_key_t)) ||
+		    !traffic_history_open(&session->process_history, TRAFFIC_MAX_PROCESSES,
+					 sizeof(traffic_process_key_t))) {
+			pr_err("traffic: failed to allocate retained traffic history\n");
 			goto out;
 		}
 	}
@@ -859,17 +899,8 @@ bool traffic_poll(void)
 
 	if (key == 'q')
 		return true;
-	if (key == 'p' || key == 'f') {
-		session->snapshot.flows = key == 'f';
-		session->display.first_row = 0;
+	if (traffic_display_key(&session->display, &session->snapshot, key))
 		traffic_render_cached(session);
-	} else if (key == 'j' || key == 'k') {
-		if (key == 'j' && session->display.first_row < session->snapshot.row_count)
-			session->display.first_row++;
-		else if (key == 'k' && session->display.first_row)
-			session->display.first_row--;
-		traffic_render_cached(session);
-	}
 	return traffic_tick(false);
 }
 

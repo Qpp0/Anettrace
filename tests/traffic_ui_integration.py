@@ -187,13 +187,35 @@ def worker_thread_identity(binary):
             assert observed["tid"] != os.getpid()
             assert re.search(r"累计接收\s+4\.00 KiB", terminal.frame), terminal.frame
             assert re.search(r"累计发送\s+6 B", terminal.frame), terminal.frame
+            sampled_time = re.search(r"时间 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", terminal.frame)
+            last_io = re.search(r"最近 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", terminal.frame)
+            assert sampled_time and last_io, terminal.frame
+            terminal.pump(12)
+            # The worker has exited: its identity and totals must survive the old 10s cutoff.
+            assert f"TID {observed['tid']} net-rx-worker" in terminal.frame, terminal.frame
+            assert local in terminal.frame and remote in terminal.frame, terminal.frame
+            assert "空闲" in terminal.frame and "累计接收 4.00 KiB" in terminal.frame, terminal.frame
+            assert last_io.group(0) in terminal.frame, terminal.frame
+            assert sampled_time.group(0) not in terminal.frame, terminal.frame
+            terminal.key("h")
+            terminal.until(lambda: "历史: 最近 60 次采样" in terminal.frame)
+            assert f"TID {observed['tid']} net-rx-worker" in terminal.frame, terminal.frame
+            assert "h 返回" in terminal.frame and "q 退出" in terminal.frame, terminal.frame
+            # Scroll to the first few samples, before the long idle period.
+            for _ in range(12):
+                terminal.key("k")
+                terminal.pump(0.06)
+            terminal.until(lambda: "RX 4.00 KiB" in terminal.frame and "TX 6 B" in terminal.frame)
+            assert "1.00 MiB" not in terminal.frame, terminal.frame
+            terminal.key("h")
+            terminal.until(lambda: "h 历史" in terminal.frame)
             terminal.key("q")
             terminal.finish()
         finally:
             run.set()
             worker.join(timeout=6)
             terminal.close()
-    print("traffic terminal: distinct worker TID/name and both endpoints PASS")
+    print("traffic terminal: exited worker retained past 10s, timed history and both endpoints PASS")
 
 
 def report_limit_and_signal(binary):
