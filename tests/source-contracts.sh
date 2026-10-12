@@ -332,6 +332,7 @@ if [[ "${ANETTRACE_STATIC_ONLY:-0}" != 1 ]]; then
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_flow_identity.py'
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_rx_capture.py'
 	python3 -m unittest discover -s "$ROOT/tests" -p 'test_icmp_capture.py'
+	python3 -m unittest discover -s "$ROOT/tests" -p 'test_trace_duration.py'
 fi
 
 echo "source contracts: ok"

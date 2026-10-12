@@ -1285,6 +1285,12 @@ err:
 static void trace_on_lost(void *ctx, int cpu, __u64 cnt)
 {
 	perfetto_export_lost(cpu, cnt);
+	if (trace_ctx.args.capture_trace || trace_ctx.args.perfetto_events) {
+		pr_warn("lost %llu events on CPU %d; continuing Perfetto capture. "
+			"Consider UID, protocol, or port filters to reduce event loss.\n",
+			(unsigned long long)cnt, cpu);
+		return;
+	}
 	pr_err("event losting happened, this can happen when the packets"
 	       "we trace are too many.\n"
 	       "Please add some filter argument (such as ip or port) to "
