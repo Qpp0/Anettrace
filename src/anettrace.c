@@ -157,7 +157,12 @@ static void do_parse_args(int argc, char *argv[])
 		{
 			.lname = "traffic", .dest = &trace_args->traffic,
 			.type = OPTION_BOOL,
-			.desc = "show per-thread TCP/UDP application bytes, including during trace capture",
+			.desc = "show per-thread TCP/UDP bytes in the legacy scrolling table",
+		},
+		{
+			.lname = "traffic-ui", .dest = &trace_args->traffic_ui,
+			.type = OPTION_BOOL,
+			.desc = "interactive TCP/UDP rates, totals and history (implies --traffic; p/f/h/j/k/q)",
 		},
 		{
 			.lname = "interval", .dest = &trace_args->traffic_interval,
@@ -502,6 +507,8 @@ static void do_parse_args(int argc, char *argv[])
 			}
 		}
 	}
+	if (trace_args->traffic_ui)
+		trace_args->traffic = true;
 	if (trace_args->traffic && trace_args->perfetto_events) {
 		pr_err("--traffic cannot be combined with --perfetto-events\n");
 		goto err;

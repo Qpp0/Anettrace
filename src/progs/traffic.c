@@ -30,6 +30,21 @@ struct {
 	__type(value, traffic_flow_value_t);
 } traffic_flows SEC(".maps");
 
+/* Session totals must survive flow LRU eviction and userspace stale cleanup. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, traffic_flow_value_t);
+} traffic_totals SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, TRAFFIC_MAX_PROCESSES);
+	__type(key, traffic_process_key_t);
+	__type(value, traffic_process_value_t);
+} traffic_processes SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, TRAFFIC_STAT_MAX);
@@ -43,6 +58,21 @@ static __always_inline void traffic_stat_inc(u32 index)
 
 	if (value)
 		__sync_fetch_and_add(value, 1);
+}
+
+static __always_inline u64 traffic_process_start(void)
+{
+	struct task_struct *task = (void *)bpf_get_current_task();
+	struct task_struct *leader = NULL;
+	u64 start_time = 0;
+
+	/* All threads share the leader's lifetime, including after PID reuse. */
+	if (!bpf_core_field_exists(task->group_leader) ||
+	    !bpf_core_field_exists(task->start_time) ||
+	    BPF_CORE_READ_INTO(&leader, task, group_leader) || !leader ||
+	    BPF_CORE_READ_INTO(&start_time, leader, start_time))
+		return 0;
+	return start_time;
 }
 
 static __always_inline int traffic_fill_key(struct sock *sk, u8 protocol,
@@ -70,6 +100,7 @@ static __always_inline int traffic_fill_key(struct sock *sk, u8 protocol,
 	key->family = BPF_CORE_READ(common, skc_family);
 	if (expected_family && key->family != expected_family)
 		return -1;
+	key->process_start_ns = traffic_process_start();
 	bpf_get_current_comm(key->comm, sizeof(key->comm));
 	if (protocol == IPPROTO_UDP) {
 		/* An unconnected socket does not hold the datagram's endpoints. */
@@ -251,13 +282,66 @@ int traffic_udp_receive_endpoints(struct pt_regs *ctx)
 	return 0;
 }
 
+static __always_inline void traffic_counter_add(traffic_flow_value_t *value,
+					       u64 bytes, bool tx, u64 now_ns)
+{
+	if (tx)
+		__sync_fetch_and_add(&value->tx_bytes, bytes);
+	else
+		__sync_fetch_and_add(&value->rx_bytes, bytes);
+	value->last_seen_ns = now_ns;
+}
+
+static __always_inline void traffic_account_process(const traffic_flow_key_t *flow,
+						   u64 bytes, bool tx, u64 now_ns)
+{
+	traffic_process_key_t key = {
+		.start_time_ns = flow->process_start_ns,
+		.tgid = flow->tgid,
+	};
+	traffic_process_value_t zero = {
+		.counters.first_seen_ns = now_ns,
+	};
+	traffic_process_value_t *value;
+	struct task_struct *task, *leader = NULL;
+
+	if (!key.start_time_ns) {
+		traffic_stat_inc(TRAFFIC_STAT_PROCESS_ID_MISS);
+		return;
+	}
+	value = bpf_map_lookup_elem(&traffic_processes, &key);
+	if (!value) {
+		task = (void *)bpf_get_current_task();
+		if (!bpf_core_field_exists(task->group_leader) ||
+		    !bpf_core_field_exists(task->comm) ||
+		    BPF_CORE_READ_INTO(&leader, task, group_leader) || !leader ||
+		    BPF_CORE_READ_INTO(&zero.comm, leader, comm))
+			__builtin_memcpy(zero.comm, flow->comm, sizeof(zero.comm));
+		bpf_map_update_elem(&traffic_processes, &key, &zero, BPF_NOEXIST);
+		/* Another thread can win the insertion; add this I/O to its value. */
+		value = bpf_map_lookup_elem(&traffic_processes, &key);
+	}
+	if (!value) {
+		traffic_stat_inc(TRAFFIC_STAT_PROCESS_DROP);
+		return;
+	}
+	traffic_counter_add(&value->counters, bytes, tx, now_ns);
+}
+
 static __always_inline void traffic_account(const traffic_flow_key_t *flow,
 					     u64 bytes, bool tx)
 {
+	u64 now_ns = bpf_ktime_get_ns();
 	traffic_flow_value_t zero = {
-		.last_seen_ns = bpf_ktime_get_ns(),
+		.first_seen_ns = now_ns,
 	};
 	traffic_flow_value_t *value;
+	u32 index = 0;
+
+	value = bpf_map_lookup_elem(&traffic_totals, &index);
+	if (value)
+		traffic_counter_add(value, bytes, tx, now_ns);
+	traffic_account_process(flow, bytes, tx, now_ns);
 
 	value = bpf_map_lookup_elem(&traffic_flows, flow);
 	if (!value) {
@@ -269,11 +353,7 @@ static __always_inline void traffic_account(const traffic_flow_key_t *flow,
 		return;
 	}
 
-	if (tx)
-		__sync_fetch_and_add(&value->tx_bytes, bytes);
-	else
-		__sync_fetch_and_add(&value->rx_bytes, bytes);
-	value->last_seen_ns = bpf_ktime_get_ns();
+	traffic_counter_add(value, bytes, tx, now_ns);
 }
 
 static __always_inline int traffic_exit(struct pt_regs *ctx, u32 operation,

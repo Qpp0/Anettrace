@@ -2,9 +2,9 @@
 
 Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具，可追踪报文在内核协议栈中的路径、定位丢包和延迟、统计线程流量，并生成包含网络与系统调度信息的 Perfetto 时间线。
 
-> 当前正式版：**v0.8.2**。完整安装说明、参数解释、模式组合、Android 抓取和排障指南已经移至 [GitHub Wiki](https://github.com/ron159/Anettrace/wiki)。
+> 当前正式版：**v0.8.4**。完整安装说明、参数解释、模式组合、Android 抓取和排障指南已经移至 [GitHub Wiki](https://github.com/ron159/Anettrace/wiki)。
 
-[下载 v0.8.2](https://github.com/ron159/Anettrace/releases/tag/v0.8.2) · [使用手册](https://github.com/ron159/Anettrace/wiki) · [CLI 完整参考](https://github.com/ron159/Anettrace/wiki/CLI-Reference) · [问题反馈](https://github.com/ron159/Anettrace/issues)
+[下载 v0.8.4](https://github.com/ron159/Anettrace/releases/tag/v0.8.4) · [使用手册](https://github.com/ron159/Anettrace/wiki) · [CLI 完整参考](https://github.com/ron159/Anettrace/wiki/CLI-Reference) · [问题反馈](https://github.com/ron159/Anettrace/issues)
 
 ## 主要功能
 
@@ -12,7 +12,7 @@ Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具�
 - 地址、端口、协议、网络命名空间、TID、UID 等组合过滤；
 - `--diag` 异常路径分析与 `--drop` 内核丢包定位；
 - TCP RTT、协议栈延迟、Socket 生命周期和 monitor 模式；
-- `--traffic` 按线程与 flow 统计 TCP/UDP 应用层收发字节；
+- `--traffic` 保留逐周期追加的线程流量表；`--traffic-ui` 启用当前速率、累计量、进程汇总及历史回看的交互界面；
 - `--capture-trace` 生成系统 Perfetto 与网络事件联合时间线；
 - `--ring-buffer` 持续抓取并在停止时保存最近 N 秒；
 - Android TCP 主动建连根因诊断与隐私受控报告。
@@ -22,11 +22,11 @@ Anettrace 是面向 Linux 与已 root Android 设备的 eBPF 网络诊断工具�
 ### Android arm64 正式版
 
 ```shell
-curl -LO https://github.com/ron159/Anettrace/releases/download/v0.8.2/anettrace-0.8.2-android-arm64-dual
-curl -LO https://github.com/ron159/Anettrace/releases/download/v0.8.2/SHA256SUMS
-grep 'anettrace-0.8.2-android-arm64-dual$' SHA256SUMS | shasum -a 256 -c -
+curl -LO https://github.com/ron159/Anettrace/releases/download/v0.8.4/anettrace-0.8.4-android-arm64-dual
+curl -LO https://github.com/ron159/Anettrace/releases/download/v0.8.4/SHA256SUMS
+grep 'anettrace-0.8.4-android-arm64-dual$' SHA256SUMS | shasum -a 256 -c -
 
-adb push anettrace-0.8.2-android-arm64-dual /data/local/tmp/anettrace
+adb push anettrace-0.8.4-android-arm64-dual /data/local/tmp/anettrace
 adb shell chmod 0755 /data/local/tmp/anettrace
 adb shell /data/local/tmp/anettrace --version
 ```
@@ -53,8 +53,11 @@ sudo ./src/anettrace -t '?'
 # 诊断指定地址的异常路径
 sudo ./src/anettrace --diag --addr 192.0.2.10
 
-# 按 UID 查看 TCP 应用层流量
+# 按 UID 查看 TCP 应用层流量（原有逐周期表格）
 sudo ./src/anettrace --traffic --proto tcp --uid 1000 --interval 2
+
+# 新界面：保留空闲线程、显示时间，按 h 回看最近 60 次采样
+sudo ./src/anettrace --traffic-ui --proto tcp --uid 1000 --interval 1
 
 # 使用设备上的自定义 Perfetto textproto 配置联合抓取
 ./anettrace --capture-trace \
@@ -76,6 +79,9 @@ sudo ./src/anettrace --traffic --proto tcp --uid 1000 --interval 2
   --perfetto-config /data/local/tmp/perfetto_cfg.pbtxt \
   --duration 10 --output /data/local/tmp/custom-system.pftrace
 ```
+
+`--traffic-ui` 已包含 `--traffic`，也支持与后台 `--capture-trace` 联用。输出重定向或
+`TERM=dumb` 时自动使用旧表格；完整操作与统计限制见[流量概览说明](docs/traffic-overview-experiment.md)。
 
 网络采集默认使用**精简模式**，显示 socket 创建/关闭、应用收发、TCP 握手和
 关键包事件。增加 `--trace-detail` 切换为**详细模式**，显示探针目录支持且设备

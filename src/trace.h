@@ -107,6 +107,7 @@ typedef struct trace_args {
 	bool intel_keep;
 	bool basic;
 	bool traffic;
+	bool traffic_ui;
 	bool monitor;
 	bool drop;
 	int  time_mode;
