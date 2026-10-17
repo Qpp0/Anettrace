@@ -1390,7 +1390,7 @@ int trace_poll()
 		poll_deadline_ns = (u64)now.tv_sec * 1000000000ULL + now.tv_nsec +
 			(u64)trace_ctx.args.duration * 1000000000ULL;
 	trace_ctx.ops->trace_ready();
-	while ((err = perf_buffer__poll(pb, 1000)) >= 0) {
+	while ((err = perf_buffer__poll(pb, trace_ctx.args.traffic_ui ? 100 : 1000)) >= 0) {
 		perfetto_export_tick();
 		if (poll_timeout(err))
 			break;
